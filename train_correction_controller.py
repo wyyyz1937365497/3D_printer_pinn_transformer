@@ -11,16 +11,27 @@ import matplotlib.pyplot as plt
 from sklearn.model_selection import train_test_split
 from torch.optim import AdamW
 from torch.amp import autocast, GradScaler
+import argparse
+from datetime import datetime, timedelta
+
+# 配置matplotlib支持中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'Liberation Sans']
+plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
 
 # ==================== 配置参数 ====================
 class Config:
-    def __init__(self):
+    def __init__(self, resume_from=None, gpu_ids=[0]):
         self.data_path = 'printer_dataset_correction/printer_gear_correction_dataset.csv'
         self.pred_model_path = './checkpoints_physical_predictor/best_physical_predictor.pth'
         self.batch_size = 1024
         self.lr = 3e-4
         self.epochs = 30
-        self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
+        self.gpu_ids = gpu_ids
+        self.resume_from = resume_from  # 添加继续训练的路径
+        if len(gpu_ids) > 1:
+            self.device = f'cuda:{gpu_ids[0]}'  # 主GPU
+        else:
+            self.device = f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu'
         self.checkpoint_dir = './checkpoints_correction_controller'
         self.max_samples = 50000
         self.seq_len = 50  # 短序列，用于实时控制
@@ -170,28 +181,52 @@ def train_correction_controller(config):
     )
     
     # 创建模型
-    model = CorrectionController(config).to(config.device)
+    model = CorrectionController(config)
     print(f"✅ 模型创建完成 | 参数量: {sum(p.numel() for p in model.parameters())}")
+    
+    # 检查是否使用多GPU
+    if len(config.gpu_ids) > 1:
+        print(f"✅ 使用多GPU训练: {config.gpu_ids}")
+        model = nn.DataParallel(model, device_ids=config.gpu_ids)
+        model = model.to(config.device)
+    else:
+        model = model.to(config.device)
     
     # 优化器
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
     scheduler = torch.optim.lr_scheduler.ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+        optimizer, mode='min', factor=0.5, patience=3
     )
     
     # 损失函数
     criterion = nn.MSELoss()
     scaler = GradScaler('cuda')
     
-    # 训练循环
+    # 从检查点恢复训练
+    start_epoch = 0
     best_val_loss = float('inf')
     train_losses = []
     val_losses = []
     
+    if config.resume_from and os.path.exists(config.resume_from):
+        print(f"🔄 从检查点恢复训练: {config.resume_from}")
+        checkpoint = torch.load(config.resume_from)
+        if isinstance(model, nn.DataParallel):
+            model.module.load_state_dict(checkpoint['model_state_dict'])
+        else:
+            model.load_state_dict(checkpoint['model_state_dict'])
+        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
+        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
+        start_epoch = checkpoint['epoch']
+        best_val_loss = checkpoint['best_val_loss']
+        train_losses = checkpoint.get('train_losses', [])
+        val_losses = checkpoint.get('val_losses', [])
+        print(f"✅ 恢复训练成功 | 从第 {start_epoch} 个epoch开始")
+
     print("\n🔥 开始训练矫正控制器...")
     print("-" * 80)
     
-    for epoch in range(config.epochs):
+    for epoch in range(start_epoch, config.epochs):
         epoch_start = time.time()
         model.train()
         total_loss = 0
@@ -230,24 +265,34 @@ def train_correction_controller(config):
         scheduler.step(avg_val_loss)
         epoch_time = time.time() - epoch_start
         
+        # 计算剩余时间
+        elapsed_time = time.time() - epoch_start
+        remaining_epochs = config.epochs - epoch - 1
+        remaining_time = elapsed_time * remaining_epochs
+        remaining_time_str = str(timedelta(seconds=int(remaining_time)))
+        
         print(f"✅ Epoch {epoch+1:2d}/{config.epochs} | "
               f"Train Loss: {avg_train_loss:.6f} | "
               f"Val Loss: {avg_val_loss:.6f} | "
-              f"Time: {epoch_time:.2f}s")
+              f"Time: {epoch_time:.2f}s | "
+              f"剩余时间: {remaining_time_str}")
         
         # 保存最佳模型
         if avg_val_loss < best_val_loss:
             best_val_loss = avg_val_loss
-            torch.save({
+            checkpoint_data = {
                 'epoch': epoch + 1,
-                'model_state_dict': model.state_dict(),
+                'model_state_dict': model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
                 'scheduler_state_dict': scheduler.state_dict(),
                 'train_loss': avg_train_loss,
                 'val_loss': avg_val_loss,
                 'best_val_loss': best_val_loss,
+                'train_losses': train_losses,
+                'val_losses': val_losses,
                 'config': config.__dict__
-            }, os.path.join(config.checkpoint_dir, 'best_correction_controller.pth'))
+            }
+            torch.save(checkpoint_data, os.path.join(config.checkpoint_dir, 'best_correction_controller.pth'))
             print(f"   💾 保存最佳矫正控制器 (验证损失: {best_val_loss:.6f})")
     
     # 绘制训练曲线
@@ -259,7 +304,8 @@ def train_correction_controller(config):
     plt.title('矫正控制器训练过程')
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(config.checkpoint_dir, 'correction_training_curve.png'))
+    plt.savefig(os.path.join(config.checkpoint_dir, 'correction_training_curve.png'), 
+                bbox_inches='tight', dpi=300, facecolor='white')
     
     print("\n" + "=" * 80)
     print(f"🎉 矫正控制器训练完成! 最佳验证损失: {best_val_loss:.6f}")
@@ -267,5 +313,11 @@ def train_correction_controller(config):
 
 # ==================== 主函数 ====================
 if __name__ == "__main__":
-    config = Config()
+    parser = argparse.ArgumentParser(description='训练矫正控制器')
+    parser.add_argument('--resume', type=str, default=None, help='从指定路径恢复训练')
+    parser.add_argument('--gpu_ids', type=str, default='0,1', help='GPU IDs (例如: "0,1,2,3")')
+    args = parser.parse_args()
+    
+    gpu_ids = [int(id) for id in args.gpu_ids.split(',')]
+    config = Config(resume_from=args.resume, gpu_ids=gpu_ids)
     train_correction_controller(config)
