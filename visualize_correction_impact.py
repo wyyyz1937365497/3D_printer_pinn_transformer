@@ -6,7 +6,7 @@ from mpl_toolkits.mplot3d import Axes3D
 import torch
 import pickle
 import os
-from train_physical_predictor import PhysicalPredictor, Config as PredictorConfig
+from train_physical_predictor import EnhancedPhysicalPredictor, Config as PredictorConfig
 from train_correction_controller import CorrectionController, Config as ControllerConfig
 
 # ==================== 加载模型和数据 ====================
@@ -14,14 +14,14 @@ def load_models():
     """加载预训练的物理预测模型和矫正控制器"""
     # 加载物理预测模型
     pred_config = PredictorConfig()
-    pred_model = PhysicalPredictor(pred_config).to(pred_config.device)
+    pred_model = EnhancedPhysicalPredictor(pred_config).to(pred_config.device)
     
-    pred_checkpoint = torch.load('./checkpoints_physical_predictor/best_physical_predictor.pth')
+    pred_checkpoint = torch.load('./checkpoints_physical_predictor_enhanced/best_physical_predictor.pth')
     pred_model.load_state_dict(pred_checkpoint['model_state_dict'])
     pred_model.eval()
     
     # 加载标准化参数
-    with open('./checkpoints_physical_predictor/normalization_params.pkl', 'rb') as f:
+    with open('./checkpoints_physical_predictor_enhanced/normalization_params.pkl', 'rb') as f:
         pred_norm_params = pickle.load(f)
     
     # 加载矫正控制器
@@ -39,20 +39,23 @@ def load_models():
     return pred_model, pred_norm_params, ctrl_model, ctrl_norm_params
 
 # ==================== 应用矫正控制 ====================
-def apply_correction(model, norm_params, features):
+def apply_correction(model, pred_norm_params, ctrl_norm_params, features):
     """应用矫正控制器生成控制信号"""
-    # 标准化输入
-    feature_mean = norm_params['feature_mean']
-    feature_std = norm_params['feature_std']
+    # 使用物理预测模型的标准化参数来标准化输入
+    feature_mean = pred_norm_params['feature_mean']
+    feature_std = pred_norm_params['feature_std']
     features_norm = (features - feature_mean) / feature_std
+    
+    # 获取模型所在的设备
+    device = next(model.parameters()).device
     
     # 生成矫正信号
     with torch.no_grad():
-        corrections_norm = model(torch.tensor(features_norm, dtype=torch.float32).to(model.device))
+        corrections_norm = model(torch.tensor(features_norm, dtype=torch.float32).to(device))
     
-    # 反标准化
-    correction_mean = norm_params['correction_mean']
-    correction_std = norm_params['correction_std']
+    # 使用矫正控制器的标准化参数进行反标准化
+    correction_mean = ctrl_norm_params['correction_mean']
+    correction_std = ctrl_norm_params['correction_std']
     corrections = corrections_norm.cpu().numpy() * correction_std + correction_mean
     
     return corrections
@@ -76,7 +79,7 @@ def visualize_print_quality():
     features = machine_df[PredictorConfig().feature_cols].values
     
     # 应用矫正
-    corrections = apply_correction(ctrl_model, ctrl_norm_params, features)
+    corrections = apply_correction(ctrl_model, pred_norm_params, ctrl_norm_params, features)
     
     # 创建可视化
     plt.figure(figsize=(15, 12))

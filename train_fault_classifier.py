@@ -189,7 +189,7 @@ def train_fault_classifier(config):
     # 优化器
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
     scheduler = ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3, verbose=True
+        optimizer, mode='min', factor=0.5, patience=3
     )
     
     # 损失函数
