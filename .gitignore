@@ -23,3 +23,4 @@ __pycache__/
 *.pkl.bz2
 *.pkl.bz
 runs/
+*.npy

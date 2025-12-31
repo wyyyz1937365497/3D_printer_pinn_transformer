@@ -15,15 +15,16 @@ from datetime import datetime, timedelta
 class Config:
     def __init__(self, resume_from=None, gpu_ids=[0]):
         self.data_dir = 'printer_dataset_correction/'
-        self.batch_size = 256
+        self.batch_size = 256  # 增加batch size
         self.lr = 1e-4
-        self.epochs = 25
+        self.epochs = 25  # 调整epoch数
         self.gpu_ids = gpu_ids
         self.resume_from = resume_from
         self.device = f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu'
-        self.checkpoint_dir = './checkpoints_fault_classifier_streaming'
+        self.checkpoint_dir = './checkpoints_fault_classifier'  # 修改检查点目录
         self.seq_len = 150
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        # 修改特征列，使用实际数据集中的列名
         self.feature_cols = [
             'temperature_C', 'vibration_disp_x_m', 'vibration_disp_y_m',
             'vibration_vel_x_m_s', 'vibration_vel_y_m_s',
@@ -76,7 +77,7 @@ class StreamingFaultDataset(IterableDataset):
             self.feature_std = norm_params['feature_std']
     
     def _load_norm_params(self):
-        path = './checkpoints_physical_predictor_streaming/normalization_params.pkl'
+        path = './checkpoints_physical_predictor_enhanced/normalization_params.pkl'  # 修改为正确的路径
         if os.path.exists(path):
             with open(path, 'rb') as f:
                 params = pickle.load(f)

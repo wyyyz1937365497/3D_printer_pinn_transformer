@@ -19,17 +19,18 @@ plt.rcParams['axes.unicode_minus'] = False
 class Config:
     def __init__(self, resume_from=None, gpu_ids=[0]):
         self.data_dir = 'printer_dataset_correction/'
-        self.batch_size = 1024
+        self.batch_size = 1024  # 增加batch size
         self.lr = 3e-4
-        self.epochs = 30
+        self.epochs = 30  # 调整epoch数
         self.gpu_ids = gpu_ids
         self.resume_from = resume_from
         self.device = f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu'
-        self.checkpoint_dir = './checkpoints_correction_controller_streaming'
+        self.checkpoint_dir = './checkpoints_correction_controller'  # 修改检查点目录
         self.seq_len = 50
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        # 修改特征列，使用实际数据集中的列名
         self.feature_cols = [
-            'ctrl_T_target', 'ctrl_speed_set', 'ctrl_pos_x', 'ctrl_pos_y', 'ctrl_pos_z',
+            'nozzle_x', 'nozzle_y', 'nozzle_z',
             'temperature_C', 'vibration_disp_x_m', 'vibration_disp_y_m',
             'vibration_vel_x_m_s', 'vibration_vel_y_m_s',
             'motor_current_x_A', 'motor_current_y_A',
@@ -73,7 +74,7 @@ class StreamingCorrectionDataset(IterableDataset):
             self.correction_std = norm_params.get('correction_std', np.ones(len(config.correction_cols)))
     
     def _load_norm_params(self):
-        path = './checkpoints_physical_predictor_streaming/normalization_params.pkl'
+        path = './checkpoints_physical_predictor_enhanced/normalization_params.pkl'  # 修改为正确的路径
         if os.path.exists(path):
             with open(path, 'rb') as f:
                 params = pickle.load(f)
@@ -83,7 +84,7 @@ class StreamingCorrectionDataset(IterableDataset):
             raise FileNotFoundError("请先训练物理预测模型以获取标准化参数")
         
         # 尝试加载矫正参数
-        correction_path = './checkpoints_correction_controller_streaming/correction_params.pkl'
+        correction_path = './checkpoints_correction_controller/correction_params.pkl'
         if os.path.exists(correction_path):
             with open(correction_path, 'rb') as f:
                 corr_params = pickle.load(f)

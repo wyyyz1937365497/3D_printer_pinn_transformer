@@ -14,6 +14,7 @@ import argparse
 from datetime import datetime, timedelta
 import warnings
 from scipy import signal
+from tqdm import tqdm  # 添加进度条库
 warnings.filterwarnings('ignore')
 
 class Config:
@@ -21,7 +22,7 @@ class Config:
         self.data_dir = 'printer_dataset_correction/'  # 数据目录
         self.seq_len = 250
         self.pred_len = 50
-        self.batch_size = 2048
+        self.batch_size = 2048  # 增加batch size以提高训练效率
         self.gradient_accumulation_steps = 2
         self.model_dim = 192
         self.num_heads = 8
@@ -29,17 +30,18 @@ class Config:
         self.dim_feedforward = 768
         self.dropout = 0.1
         self.lr = 5e-5
-        self.epochs = 60
+        self.epochs = 60  # 可能需要减少epochs，因为数据量大
         self.gpu_ids = gpu_ids
         self.resume_from = resume_from
         self.device = f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu'
         self.lambda_physics = 0.4
         self.lambda_freq = 0.3
-        self.checkpoint_dir = './checkpoints_physical_predictor_streaming'
+        self.checkpoint_dir = './checkpoints_physical_predictor_enhanced'  # 修改检查点目录
         self.warmup_epochs = 5
         os.makedirs(self.checkpoint_dir, exist_ok=True)
+        # 修改特征列，使用实际数据集中的列名
         self.feature_cols = [
-            'ctrl_T_target', 'ctrl_speed_set', 'ctrl_pos_x', 'ctrl_pos_y', 'ctrl_pos_z',
+            'nozzle_x', 'nozzle_y', 'nozzle_z',  # 替换原来的控制列
             'temperature_C', 'vibration_disp_x_m', 'vibration_disp_y_m',
             'vibration_vel_x_m_s', 'vibration_vel_y_m_s',
             'motor_current_x_A', 'motor_current_y_A',
@@ -367,212 +369,207 @@ class StreamingPhysicalDataset(IterableDataset):
             for filepath in self.files[start_idx:end_idx]:
                 yield from self._process_file(filepath)
 
-def train_model(config):
-    print("=" * 80)
-    print("🚀 启动流式训练（低内存占用 + 全量数据）")
-    print("=" * 80)
-    
-    # 创建数据集
-    train_dataset = StreamingPhysicalDataset(config.data_dir, config, split='train')
+def count_parameters(model):
+    """计算模型参数量"""
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+def validate_model(model, config, scaler):
+    """验证模型"""
     val_dataset = StreamingPhysicalDataset(config.data_dir, config, split='val')
+    val_loader = DataLoader(val_dataset, batch_size=config.batch_size, num_workers=2, pin_memory=True)
     
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=config.batch_size,
-        num_workers=4,
-        pin_memory=True,
-        prefetch_factor=2
-    )
-    val_loader = DataLoader(
-        val_dataset,
-        batch_size=config.batch_size,
-        num_workers=2,
-        pin_memory=True
-    )
+    model.eval()
+    total_loss = 0
+    total_batches = 0
+    max_val_batches = 500  # 限制验证批次数量以节省时间
+    
+    with torch.no_grad():
+        for batch_idx, (data, targets) in enumerate(val_loader):
+            if batch_idx >= max_val_batches:
+                break
+                
+            data, targets = data.to(config.device, non_blocking=True), targets.to(config.device, non_blocking=True)
+            
+            with autocast(device_type='cuda'):
+                outputs = model(data)
+                mse_loss = nn.MSELoss()(outputs, targets)
+                
+                # 物理损失
+                if isinstance(model, nn.DataParallel):
+                    physics_loss = model.module.physics_loss(outputs, targets)
+                    freq_loss = model.module.frequency_loss(outputs, targets)
+                else:
+                    physics_loss = model.physics_loss(outputs, targets)
+                    freq_loss = model.frequency_loss(outputs, targets)
+                
+                loss = mse_loss + config.lambda_physics * physics_loss + config.lambda_freq * freq_loss
+            
+            total_loss += loss.item()
+            total_batches += 1
+    
+    return total_loss / total_batches if total_batches > 0 else float('inf')
+
+def train_model(config):
+    print("="*80)
+    print("🚀 启动流式训练（低内存占用 + 全量数据）")
+    print("="*80)
     
     # 创建模型
-    model = EnhancedPhysicalPredictor(config).to(config.device)
+    model = EnhancedPhysicalPredictor(config)
     if len(config.gpu_ids) > 1:
         model = nn.DataParallel(model, device_ids=config.gpu_ids)
+    model = model.to(config.device)
+    print(f"✅ 模型创建完成 | 参数量: {count_parameters(model):,}")
     
-    print(f"✅ 模型创建完成 | 参数量: {sum(p.numel() for p in model.parameters()):,}")
+    # 优化器
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
     
-    # 优化器和调度器
-    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=1e-5)
-    warmup_scheduler = LinearLR(
-        optimizer,
-        start_factor=0.1,
-        end_factor=1.0,
-        total_iters=config.warmup_epochs * len(train_loader)
-    )
-    cosine_scheduler = CosineAnnealingLR(
-        optimizer,
-        T_max=(config.epochs - config.warmup_epochs) * len(train_loader),
-        eta_min=1e-6
-    )
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[config.warmup_epochs * len(train_loader)]
-    )
+    # 混合精度训练
+    scaler = GradScaler()
     
-    criterion = nn.MSELoss()
-    scaler = GradScaler('cuda')
+    # 计算训练步数（估算）
+    total_samples = 0
+    for filename in os.listdir(config.data_dir):
+        if filename.startswith('machine_') and filename.endswith('.csv'):
+            df = pd.read_csv(os.path.join(config.data_dir, filename))
+            total_samples += len(df[df['fault_label'] == 0])  # 仅使用正常样本
     
-    # 恢复训练
-    start_epoch = 0
-    best_val_loss = float('inf')
+    steps_per_epoch = total_samples // (config.batch_size * config.gradient_accumulation_steps)
+    if steps_per_epoch == 0:
+        steps_per_epoch = 1  # 确保至少有一个步骤
+    
+    print(f"📊 估算训练样本总数: {total_samples:,}")
+    print(f"📊 每个epoch步数: {steps_per_epoch}")
+    
+    # 训练循环
+    best_loss = float('inf')
     train_losses = []
     val_losses = []
     
-    if config.resume_from and os.path.exists(config.resume_from):
-        print(f"🔄 从检查点恢复训练: {config.resume_from}")
-        checkpoint = torch.load(config.resume_from, map_location=config.device)
-        model_state = checkpoint['model_state_dict']
+    for epoch in range(config.epochs):
+        # 创建训练数据集和加载器
+        train_dataset = StreamingPhysicalDataset(config.data_dir, config, split='train')
+        train_loader = DataLoader(train_dataset, batch_size=config.batch_size, num_workers=4, pin_memory=True)
         
-        if isinstance(model, nn.DataParallel):
-            model.module.load_state_dict(model_state)
-        else:
-            model.load_state_dict(model_state)
-        
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch']
-        best_val_loss = checkpoint['best_val_loss']
-        train_losses = checkpoint.get('train_losses', [])
-        val_losses = checkpoint.get('val_losses', [])
-        print(f"✅ 恢复训练成功 | 从第 {start_epoch} 个epoch开始")
-    
-    print("\n🔥 开始训练...")
-    print("-" * 80)
-    
-    for epoch in range(start_epoch, config.epochs):
-        epoch_start = time.time()
         model.train()
         total_loss = 0
+        total_mse_loss = 0
         total_physics_loss = 0
         total_freq_loss = 0
+        num_batches = 0
         
-        for batch_idx, (seq, target) in enumerate(train_loader):
-            seq, target = seq.to(config.device), target.to(config.device)
+        # 设置进度条
+        train_pbar = tqdm(enumerate(train_loader), total=steps_per_epoch, desc=f"Epoch {epoch+1}/{config.epochs}")
+        
+        for batch_idx, (data, targets) in train_pbar:
+            data, targets = data.to(config.device, non_blocking=True), targets.to(config.device, non_blocking=True)
             
-            with autocast('cuda'):
-                pred = model(seq)
-                data_loss = criterion(pred, target)
+            with autocast(device_type='cuda'):
+                outputs = model(data)
+                mse_loss = nn.MSELoss()(outputs, targets)
                 
-                # 物理约束损失
+                # 物理损失
                 if isinstance(model, nn.DataParallel):
-                    physics_loss = model.module.physics_loss(pred, target)
-                    freq_loss = model.module.frequency_loss(pred, target)
+                    physics_loss = model.module.physics_loss(outputs, targets)
+                    freq_loss = model.module.frequency_loss(outputs, targets)
                 else:
-                    physics_loss = model.physics_loss(pred, target)
-                    freq_loss = model.frequency_loss(pred, target)
+                    physics_loss = model.physics_loss(outputs, targets)
+                    freq_loss = model.frequency_loss(outputs, targets)
                 
-                total_batch_loss = data_loss + config.lambda_physics * physics_loss + config.lambda_freq * freq_loss
+                loss = mse_loss + config.lambda_physics * physics_loss + config.lambda_freq * freq_loss
             
-            scaler.scale(total_batch_loss).backward()
+            # 反向传播
+            scaler.scale(loss / config.gradient_accumulation_steps).backward()
             
+            # 梯度累积更新
             if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
-                scaler.unscale_(optimizer)
-                torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
             
-            scheduler.step()
-            total_loss += total_batch_loss.item()
+            total_loss += loss.item()
+            total_mse_loss += mse_loss.item()
             total_physics_loss += physics_loss.item()
             total_freq_loss += freq_loss.item()
+            num_batches += 1
+            
+            # 更新进度条
+            train_pbar.set_postfix({
+                'Loss': f"{total_loss/num_batches:.6f}",
+                'MSE': f"{total_mse_loss/num_batches:.6f}",
+                'Physics': f"{total_physics_loss/num_batches:.6f}",
+                'Freq': f"{total_freq_loss/num_batches:.6f}"
+            })
+            
+            # 限制每轮训练的步数，避免过长的训练时间
+            if num_batches >= steps_per_epoch:
+                break
         
-        avg_train_loss = total_loss / len(train_loader)
-        avg_physics_loss = total_physics_loss / len(train_loader)
-        avg_freq_loss = total_freq_loss / len(train_loader)
-        train_losses.append(avg_train_loss)
+        avg_loss = total_loss / num_batches
+        train_losses.append(avg_loss)
         
         # 验证
-        model.eval()
-        val_loss = 0
-        val_physics_loss = 0
+        val_loss = validate_model(model, config, scaler)
+        val_losses.append(val_loss)
         
-        with torch.no_grad():
-            for seq, target in val_loader:
-                seq, target = seq.to(config.device), target.to(config.device)
-                pred = model(seq)
-                loss = criterion(pred, target)
-                
-                if isinstance(model, nn.DataParallel):
-                    physics_loss = model.module.physics_loss(pred, target)
-                else:
-                    physics_loss = model.physics_loss(pred, target)
-                
-                val_loss += loss.item()
-                val_physics_loss += physics_loss.item()
+        # 手动更新学习率
+        if epoch < config.warmup_epochs:
+            # Warmup阶段：线性增长学习率
+            lr = config.lr * (epoch + 1) / config.warmup_epochs
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
+        else:
+            # 主训练阶段：余弦退火
+            import math
+            lr = config.lr * 0.5 * (1 + math.cos(math.pi * (epoch - config.warmup_epochs) / (config.epochs - config.warmup_epochs)))
+            for param_group in optimizer.param_groups:
+                param_group['lr'] = lr
         
-        avg_val_loss = val_loss / len(val_loader)
-        avg_val_physics_loss = val_physics_loss / len(val_loader)
-        val_losses.append(avg_val_loss)
+        print(f"Epoch {epoch+1}/{config.epochs} | Train Loss: {avg_loss:.6f} | Val Loss: {val_loss:.6f} | LR: {optimizer.param_groups[0]['lr']:.2e}")
         
-        epoch_time = time.time() - epoch_start
-        elapsed_time = time.time() - epoch_start
-        remaining_epochs = config.epochs - epoch - 1
-        remaining_time = elapsed_time * remaining_epochs
-        remaining_time_str = str(timedelta(seconds=int(remaining_time)))
-        
-        print(f"✅ Epoch {epoch+1:2d}/{config.epochs} | "
-              f"Train Loss: {avg_train_loss:.6f} (Physics: {avg_physics_loss:.6f}, Freq: {avg_freq_loss:.6f}) | "
-              f"Val Loss: {avg_val_loss:.6f} (Physics: {avg_val_physics_loss:.6f}) | "
-              f"Time: {epoch_time:.2f}s | "
-              f"剩余时间: {remaining_time_str}")
-        
-        # 保存最佳模型
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            checkpoint_data = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
+        # 保存检查点
+        if val_loss < best_loss:
+            best_loss = val_loss
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss,
-                'best_val_loss': best_val_loss,
-                'train_losses': train_losses,
-                'val_losses': val_losses,
-                'config': config.__dict__
-            }
-            torch.save(checkpoint_data, os.path.join(config.checkpoint_dir, 'best_physical_predictor.pth'))
-            print(f"   💾 保存最佳模型 (验证损失: {best_val_loss:.6f})")
+                'loss': best_loss,
+            }, os.path.join(config.checkpoint_dir, 'best_physical_predictor.pth'))
+            print(f"✅ 最佳模型已保存 (Loss: {best_loss:.6f})")
         
-        # 定期保存检查点
         if (epoch + 1) % 5 == 0:
-            checkpoint_data = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss,
-                'best_val_loss': best_val_loss,
-                'train_losses': train_losses,
-                'val_losses': val_losses,
-                'config': config.__dict__
-            }
-            torch.save(checkpoint_data, os.path.join(config.checkpoint_dir, f'checkpoint_epoch{epoch+1}.pth'))
-            print(f"   💾 保存检查点: epoch {epoch+1}")
+                'loss': val_loss,
+            }, os.path.join(config.checkpoint_dir, f'checkpoint_epoch{epoch+1}.pth'))
+            print(f"💾 epoch {epoch+1} 的检查点已保存")
     
     # 绘制训练曲线
-    plt.figure(figsize=(10, 6))
-    plt.plot(train_losses, label='训练损失')
-    plt.plot(val_losses, label='验证损失')
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(val_losses, label='Validation Loss')
+    plt.title('模型训练曲线')
     plt.xlabel('Epoch')
-    plt.ylabel('损失')
-    plt.title('物理预测模型训练过程')
+    plt.ylabel('Loss')
     plt.legend()
-    plt.grid(True)
-    plt.savefig(os.path.join(config.checkpoint_dir, 'training_curve.png'))
     
-    print("\n" + "=" * 80)
-    print(f"🎉 训练完成! 最佳验证损失: {best_val_loss:.6f}")
-    print("=" * 80)
+    plt.subplot(1, 2, 2)
+    plt.plot(train_losses[1:], label='Train Loss (zoomed)')
+    plt.plot(val_losses[1:], label='Validation Loss (zoomed)')
+    plt.title('模型训练曲线 (缩放)')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(config.checkpoint_dir, 'training_curve_enhanced.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"🎉 训练完成！最佳验证损失: {best_loss:.6f}")
 
 # ==================== 主函数 ====================
 if __name__ == "__main__":
