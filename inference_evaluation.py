@@ -8,7 +8,7 @@ from sklearn.metrics import classification_report, confusion_matrix, mean_square
 import os
 import pickle
 import time
-from train_pinn_transformer_multitask import PrinterPINN_MultiTask, Config
+from train_physical_predictor import PrinterPINN_MultiTask, Config
 
 class NozzleInferenceEvaluator:
     def __init__(self, model_path, config_path=None):
