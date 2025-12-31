@@ -1,24 +1,24 @@
-3D´òÓ¡»úPINN-TransformerÄ£ĞÍÍÆÀíÆÀ¹À±¨¸æ
+3Dæ‰“å°æœºPINN-Transformeræ¨¡å‹æ¨ç†è¯„ä¼°æŠ¥å‘Š
 ============================================================
-ÆÀ¹ÀÊ±¼ä: 2025-12-31 11:00:28
-Ä£ĞÍÂ·¾¶: F:\AI\3D_printer_pinn_transformer\checkpoints_dual_gpu/best_multitask_model.pth
-Êı¾İÑù±¾Êı: 9752
+è¯„ä¼°æ—¶é—´: 2025-12-31 11:20:53
+æ¨¡å‹è·¯å¾„: F:\AI\3D_printer_pinn_transformer\checkpoints_dual_gpu/best_multitask_model.pth
+æ•°æ®æ ·æœ¬æ•°: 9752
 
-¹Ø¼üĞÔÄÜÖ¸±êÕªÒª:
+å…³é”®æ€§èƒ½æŒ‡æ ‡æ‘˜è¦:
 ----------------------------------------
-1. ÎïÀí³¡ÖØ¹¹ĞÔÄÜ:
+1. ç‰©ç†åœºé‡æ„æ€§èƒ½:
    temperature_C       : RMSE = 0.635149
    vibration_disp_x_m  : RMSE = 0.016931
    vibration_disp_y_m  : RMSE = 0.016737
 
-2. ¹ÊÕÏ·ÖÀàĞÔÄÜ:
-   ×¼È·ÂÊ: 1.0000
+2. æ•…éšœåˆ†ç±»æ€§èƒ½:
+   å‡†ç¡®ç‡: 1.0000
 
-3. RULÔ¤²âĞÔÄÜ:
-   RMSE: 48.38 Ãë
+3. RULé¢„æµ‹æ€§èƒ½:
+   RMSE: 48.38 ç§’
 
 ============================================================
-ÏêÏ¸½á¹ûÇë²é¿´Éú³ÉµÄÍ¼ÏñÎÄ¼ş:
+è¯¦ç»†ç»“æœè¯·æŸ¥çœ‹ç”Ÿæˆçš„å›¾åƒæ–‡ä»¶:
    - physics_reconstruction.png
    - inference_confusion_matrix.png
    - rul_prediction_comparison.png

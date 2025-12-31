@@ -439,6 +439,11 @@ class NozzleInferenceEvaluator:
     
     def plot_physics_reconstruction(self, physics_preds, ground_truth, metrics):
         """绘制物理场重构结果"""
+        # 设置matplotlib支持中文字体
+        import matplotlib
+        matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'Liberation Sans']
+        matplotlib.rcParams['axes.unicode_minus'] = False  # 正常显示负号
+        
         fig, axes = plt.subplots(3, 2, figsize=(15, 12))
         fig.suptitle('物理场重构结果对比', fontsize=16)
         
@@ -465,7 +470,10 @@ class NozzleInferenceEvaluator:
         
         plt.tight_layout()
         plot_path = os.path.join(self.config.checkpoint_dir, 'physics_reconstruction.png')
-        plt.savefig(plot_path)
+        plt.savefig(plot_path, 
+                    bbox_inches='tight', 
+                    dpi=300, 
+                    facecolor='white')
         plt.close()
         
         print(f"   物理场重构图已保存: {plot_path}")
@@ -478,7 +486,7 @@ class NozzleInferenceEvaluator:
         
         report_path = os.path.join(self.config.checkpoint_dir, 'inference_evaluation_report.txt')
         
-        with open(report_path, 'w') as f:
+        with open(report_path, 'w', encoding='utf-8') as f:
             f.write("3D打印机PINN-Transformer模型推理评估报告\n")
             f.write("="*60 + "\n")
             f.write(f"评估时间: {time.strftime('%Y-%m-%d %H:%M:%S')}\n")
