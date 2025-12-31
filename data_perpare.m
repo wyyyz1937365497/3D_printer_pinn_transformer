@@ -244,7 +244,7 @@ for t = 2:N_steps
         temp_error = thermal_model.T_target(mid) - prev_temp;
         
         % 温度传感器故障
-        is_temp_sensor_fault = (fault_types(fault_idx) == 3 && is_faulty);
+        is_temp_sensor_fault = (is_faulty && fault_idx > 0 && fault_idx <= length(fault_types)) && (fault_types(fault_idx) == 3);
         measured_temp = prev_temp;
         if is_temp_sensor_fault
             measured_temp = prev_temp * (0.85 + 0.1*rand());
@@ -262,7 +262,7 @@ for t = 2:N_steps
         prev_vel_y = vibration_vel_y(t-1, mid);
         
         % 机械故障（刚度降低）
-        is_mech_fault = (fault_types(fault_idx) == 2 && is_faulty);
+        is_mech_fault = (is_faulty && fault_idx > 0 && fault_idx <= length(fault_types)) && (fault_types(fault_idx) == 2);
         if is_mech_fault
             kx = vibration_model.stiffness_x(mid) * 0.6;  % 刚度降低40%
             ky = vibration_model.stiffness_y(mid) * 0.6;
@@ -281,7 +281,7 @@ for t = 2:N_steps
         
         % 电机性能故障
         motor_factor = 1.0;
-        is_motor_fault = (fault_types(fault_idx) == 3 && is_faulty);
+        is_motor_fault = (is_faulty && fault_idx > 0 && fault_idx <= length(fault_types)) && (fault_types(fault_idx) == 3);
         if is_motor_fault
             motor_factor = 0.7;  % 电机输出力降低30%
         end
@@ -318,7 +318,7 @@ for t = 2:N_steps
         nozzle_position_z(t, mid) = target_z;
         
         % 挤出压力
-        is_nozzle_fault = (fault_types(fault_idx) == 1 && is_faulty);
+        is_nozzle_fault = (is_faulty && fault_idx > 0 && fault_idx <= length(fault_types)) && (fault_types(fault_idx) == 1);
         if is_nozzle_fault
             pressure_multiplier = 1.8 + 0.4*rand();
         else
