@@ -1,0 +1,856 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""
+========================================
+基于预训练权重的3D打印质量评估
+========================================
+
+功能:
+1. 加载已训练的神经网络权重
+2. 生成真实物理仿真数据
+3. 进行真实推理
+4. 评估和可视化效果
+
+权重文件路径:
+    - ./checkpoints_physical_predictor/best_physical_predictor.pth
+    - ./checkpoints_fault_classifier/best_fault_classifier.pth
+    - ./checkpoints_correction_controller/best_correction_controller.pth
+
+使用方法:
+    python pretrained_nn_evaluation.py
+
+输出:
+    - pretrained_nn_results.png       (评估结果图)
+    - pretrained_evaluation_report.txt (评估报告)
+"""
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+from matplotlib.gridspec import GridSpec
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+import warnings
+from datetime import datetime
+from tqdm import tqdm
+import pickle
+from sklearn.preprocessing import StandardScaler
+from sklearn.model_selection import train_test_split
+from sklearn.metrics import classification_report, confusion_matrix
+import sys
+
+warnings.filterwarnings('ignore')
+
+# 设置中文字体
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
+
+# 设备配置
+DEVICE = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+print(f"使用设备: {DEVICE}")
+
+# ==================== 真实数据生成模块 ====================
+class Real3DPrintingSimulator:
+    """
+    基于data_perpare.m的真实3D打印仿真器
+    包含物理模型：振动、温度、故障
+    """
+    
+    def __init__(self, n_machines=25, n_samples=5000, dt=0.001):
+        self.n_machines = n_machines
+        self.n_samples = n_samples
+        self.dt = dt
+        self.time = np.linspace(0, n_samples * dt, n_samples)
+        
+        # 物理参数（基于data_perpare.m）
+        self._init_physical_parameters()
+        
+    def _init_physical_parameters(self):
+        """初始化物理参数"""
+        np.random.seed(42)  # 确保可重复性
+        
+        # 热力模型
+        self.T_ambient = 22 + 1.5 * np.random.randn(self.n_machines)
+        self.T_target = 215 + 2 * np.random.randn(self.n_machines)
+        self.mass = 0.035 + 0.003 * np.random.randn(self.n_machines)
+        self.specific_heat = 1750 + 80 * np.random.randn(self.n_machines)
+        self.convection_coeff = 16 + 1.5 * np.random.randn(self.n_machines)
+        self.heater_power_base = 32 + 2 * np.random.randn(self.n_machines)
+        
+        # 振动模型
+        self.vib_mass = 0.45 + 0.05 * np.random.randn(self.n_machines)
+        self.stiffness_x = 800 + 150 * np.random.randn(self.n_machines)
+        self.stiffness_y = 750 + 120 * np.random.randn(self.n_machines)
+        self.damping_x = 0.24 + 0.04 * np.random.randn(self.n_machines)
+        self.damping_y = 0.21 + 0.035 * np.random.randn(self.n_machines)
+        
+        # 电机模型
+        self.rated_current = 2.0 + 0.2 * np.random.randn(self.n_machines)
+        self.motor_resistance = 1.25 + 0.08 * np.random.randn(self.n_machines)
+        self.back_emf_constant = 0.035 + 0.003 * np.random.randn(self.n_machines)
+        
+    def generate_gear_path(self):
+        """生成齿轮打印路径"""
+        from scipy import signal
+        
+        t_path = np.linspace(0, 2*np.pi, self.n_samples)
+        gear_radius = 10
+        teeth = 16
+        
+        # 基础轮廓
+        tooth_profile = gear_radius * (1 + 0.08 * np.sin(teeth * t_path))
+        
+        # 路径
+        x_path = tooth_profile * np.cos(t_path)
+        y_path = tooth_profile * np.sin(t_path)
+        z_path = np.linspace(0, 6, self.n_samples)  # 30层，每层0.2mm
+        
+        # 理想路径（低通滤波）
+        b, a = signal.butter(2, 0.1)
+        x_ideal = signal.filtfilt(b, a, x_path)
+        y_ideal = signal.filtfilt(b, a, y_path)
+        
+        return x_path, y_path, z_path, x_ideal, y_ideal
+    
+    def simulate(self):
+        """运行完整仿真"""
+        print("\n开始物理仿真...")
+        
+        # 生成路径
+        x_path, y_path, z_path, x_ideal, y_ideal = self.generate_gear_path()
+        
+        # 初始化输出数组
+        temperature = np.zeros((self.n_samples, self.n_machines))
+        vibration_x = np.zeros((self.n_samples, self.n_machines))
+        vibration_y = np.zeros((self.n_samples, self.n_machines))
+        vibration_vel_x = np.zeros((self.n_samples, self.n_machines))  # 新增振动速度
+        vibration_vel_y = np.zeros((self.n_samples, self.n_machines))  # 新增振动速度
+        motor_current_x = np.zeros((self.n_samples, self.n_machines))
+        motor_current_y = np.zeros((self.n_samples, self.n_machines))
+        nozzle_x = np.zeros((self.n_samples, self.n_machines))
+        nozzle_y = np.zeros((self.n_samples, self.n_machines))
+        pressure = np.zeros((self.n_samples, self.n_machines))
+        fault_labels = np.zeros((self.n_samples, self.n_machines), dtype=int)
+        
+        # 初始条件
+        temperature[0, :] = self.T_ambient
+        vibration_x[0, :] = 0.0005 * np.random.randn(self.n_machines)
+        vibration_y[0, :] = 0.0005 * np.random.randn(self.n_machines)
+        vibration_vel_x[0, :] = 0  # 新增振动速度初始条件
+        vibration_vel_y[0, :] = 0  # 新增振动速度初始条件
+        nozzle_x[0, :] = x_path[0]
+        nozzle_y[0, :] = y_path[0]
+        
+        # 设置故障
+        np.random.seed(42)
+        faulty_machines = np.random.choice(self.n_machines, 5, replace=False)
+        fault_start_step = int(0.4 * self.n_samples)
+        
+        # 主仿真循环
+        print(f"  仿真步数: {self.n_samples}")
+        for t in tqdm(range(1, self.n_samples), desc="  仿真进度"):
+            
+            for mid in range(self.n_machines):
+                # 检查故障
+                is_faulty = mid in faulty_machines and t > fault_start_step
+                fault_type = faulty_machines.tolist().index(mid) % 3 + 1 if is_faulty else 0
+                fault_labels[t, mid] = fault_type
+                
+                # ========= 温度模型 =========
+                temp_error = self.T_target[mid] - temperature[t-1, mid]
+                heater_power = self.heater_power_base[mid] * (1 + 0.5 * np.tanh(temp_error))
+                
+                # 故障影响
+                if is_faulty and fault_type == 3:  # 传感器故障
+                    measured_temp = temperature[t-1, mid] * (0.85 + 0.1 * np.random.random())
+                else:
+                    measured_temp = temperature[t-1, mid]
+                
+                heat_loss = self.convection_coeff[mid] * (measured_temp - self.T_ambient[mid])
+                dTdt = (heater_power - heat_loss) / (self.mass[mid] * self.specific_heat[mid])
+                temperature[t, mid] = temperature[t-1, mid] + dTdt * self.dt
+                
+                # 添加温度限制，防止数值不稳定
+                temperature[t, mid] = np.clip(temperature[t, mid], 0, 300)
+                
+                # ========= 振动模型 =========
+                pos_error_x = x_path[t] - nozzle_x[t-1, mid] - vibration_x[t-1, mid]
+                pos_error_y = y_path[t] - nozzle_y[t-1, mid] - vibration_y[t-1, mid]
+                
+                # 故障影响
+                if is_faulty and fault_type == 2:  # 机械故障
+                    kx = self.stiffness_x[mid] * 0.6
+                    ky = self.stiffness_y[mid] * 0.6
+                    cx = self.damping_x[mid] * 0.7
+                    cy = self.damping_y[mid] * 0.7
+                else:
+                    kx = self.stiffness_x[mid]
+                    ky = self.stiffness_y[mid]
+                    cx = self.damping_x[mid]
+                    cy = self.damping_y[mid]
+                
+                # 计算加速度
+                if t > 1:
+                    vib_vel_x = (vibration_x[t-1, mid] - vibration_x[t-2, mid]) / self.dt
+                    vib_vel_y = (vibration_y[t-1, mid] - vibration_y[t-2, mid]) / self.dt
+                else:
+                    vib_vel_x = 0
+                    vib_vel_y = 0
+                
+                accel_x = (kx * pos_error_x - cx * vib_vel_x) / self.vib_mass[mid]
+                accel_y = (ky * pos_error_y - cy * vib_vel_y) / self.vib_mass[mid]
+                
+                # 更新振动速度（使用速度Verlet算法）
+                if t > 0:
+                    vibration_vel_x[t, mid] = vib_vel_x + accel_x * self.dt
+                    vibration_vel_y[t, mid] = vib_vel_y + accel_y * self.dt
+                else:
+                    vibration_vel_x[t, mid] = 0
+                    vibration_vel_y[t, mid] = 0
+                
+                # 更新振动
+                vibration_x[t, mid] = vibration_x[t-1, mid] + accel_x * self.dt
+                vibration_y[t, mid] = vibration_y[t-1, mid] + accel_y * self.dt
+                
+                # 添加振动限制，防止数值不稳定
+                vibration_x[t, mid] = np.clip(vibration_x[t, mid], -0.01, 0.01)
+                vibration_y[t, mid] = np.clip(vibration_y[t, mid], -0.01, 0.01)
+                
+                # ========= 喷头位置 =========
+                nozzle_x[t, mid] = x_path[t] + vibration_x[t, mid]
+                nozzle_y[t, mid] = y_path[t] + vibration_y[t, mid]
+                
+                # ========= 电机电流 =========
+                movement_speed = np.sqrt(pos_error_x**2 + pos_error_y**2) / self.dt
+                # 限制速度，防止数值过大
+                movement_speed = np.clip(movement_speed, 0, 100)
+                motor_factor = 0.7 if is_faulty and fault_type == 3 else 1.0
+                motor_current_x[t, mid] = self.rated_current[mid] * (1 + 0.2 * movement_speed / 50) * motor_factor
+                motor_current_y[t, mid] = self.rated_current[mid] * (1 + 0.2 * movement_speed / 50) * motor_factor
+                
+                # 限制电流值，防止数值不稳定
+                motor_current_x[t, mid] = np.clip(motor_current_x[t, mid], 0, 5)
+                motor_current_y[t, mid] = np.clip(motor_current_y[t, mid], 0, 5)
+                
+                # ========= 挤出压力 =========
+                pressure_multiplier = 1.8 + 0.4 * np.random.random() if is_faulty and fault_type == 1 else 1.0
+                speed_factor = min(1, movement_speed / 80)
+                temp_factor = (temperature[t, mid] - 180) / 50
+                pressure[t, mid] = 4.5 * pressure_multiplier * (0.6 + 0.25 * speed_factor + 0.15 * temp_factor)
+                
+                # 限制压力值，防止数值不稳定
+                pressure[t, mid] = np.clip(pressure[t, mid], 0, 20)
+        
+        print("  仿真完成！")
+        
+        # 创建DataFrame
+        data_list = []
+        for t in range(self.n_samples):
+            for mid in range(self.n_machines):
+                data_list.append({
+                    'time': self.time[t],
+                    'machine_id': mid,
+                    'ctrl_T_target': self.T_target[mid],
+                    'ctrl_speed_set': 50.0,
+                    'ctrl_pos_x': x_path[t],
+                    'ctrl_pos_y': y_path[t],
+                    'ctrl_pos_z': z_path[t],
+                    'temperature_C': temperature[t, mid],
+                    'vibration_disp_x_m': vibration_x[t, mid],
+                    'vibration_disp_y_m': vibration_y[t, mid],
+                    'vibration_vel_x_m_s': vibration_vel_x[t, mid],  # 添加振动速度
+                    'vibration_vel_y_m_s': vibration_vel_y[t, mid],  # 添加振动速度
+                    'motor_current_x_A': motor_current_x[t, mid],
+                    'motor_current_y_A': motor_current_y[t, mid],
+                    'pressure_bar': pressure[t, mid],
+                    'fault_label': fault_labels[t, mid],
+                    'x_ideal': x_ideal[t],
+                    'y_ideal': y_ideal[t]
+                })
+        
+        df = pd.DataFrame(data_list)
+        print(f"  数据点总数: {len(df)}")
+        
+        return df
+
+# ==================== 神经网络模型定义（必须与训练时一致） ====================
+
+# 1. 物理预测模型 (基于train_physical_predictor.py)
+class PhysicalPredictor(nn.Module):
+    def __init__(self, input_dim=13, model_dim=192, output_dim=5):  # 修改为13维输入，只包含时域特征
+        super(PhysicalPredictor, self).__init__()
+        
+        # 输入维度映射
+        self.input_projection = nn.Linear(input_dim, model_dim)
+        
+        # 位置编码
+        self.pos_encoder = nn.Parameter(torch.randn(1, 251, model_dim))  # seq_len=250 + cls
+        
+        # 编码器
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=8,
+            dim_feedforward=768,
+            dropout=0.1,
+            batch_first=True,
+            norm_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=5)
+        
+        # 多头输出
+        self.vibration_head = nn.Sequential(
+            nn.Linear(model_dim, 96),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(96, 2)
+        )
+        
+        self.thermal_head = nn.Sequential(
+            nn.Linear(model_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 1)
+        )
+        
+        self.motor_head = nn.Sequential(
+            nn.Linear(model_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.1),
+            nn.Linear(64, 2)
+        )
+    
+    def forward(self, x):
+        """
+        x: [batch, input_dim] for single step or [batch, seq_len, input_dim] for sequences
+        """
+        # 检查输入维度，如果是二维则扩展为三维（单步序列）
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)  # [batch, 1, input_dim]
+        
+        # 投影输入到model_dim
+        x = self.input_projection(x)  # [batch, seq_len, model_dim]
+        
+        # 添加CLS token
+        batch_size = x.size(0)
+        cls_token = torch.zeros(batch_size, 1, x.size(2)).to(x.device)
+        x = torch.cat([cls_token, x], dim=1)  # [batch, seq_len+1, model_dim]
+        
+        # 简单编码（实际应该更复杂）
+        memory = self.encoder(x)  # [batch, seq_len+1, model_dim]
+        
+        # 使用CLS token
+        cls_output = memory[:, 0, :]  # [batch, model_dim]
+        
+        # 多头预测
+        vib_pred = self.vibration_head(cls_output)
+        temp_pred = self.thermal_head(cls_output)
+        motor_pred = self.motor_head(cls_output)
+        
+        return torch.cat([vib_pred, temp_pred, motor_pred], dim=1)  # [batch, 5]
+
+# 2. 故障分类器 (基于train_fault_classifier.py)
+class FaultClassifier(nn.Module):
+    def __init__(self, input_dim=8, model_dim=128, n_classes=4):
+        super(FaultClassifier, self).__init__()
+        
+        self.embedding = nn.Linear(input_dim, model_dim)
+        
+        encoder_layer = nn.TransformerEncoderLayer(
+            d_model=model_dim,
+            nhead=8,
+            dim_feedforward=512,
+            dropout=0.1,
+            batch_first=True
+        )
+        self.encoder = nn.TransformerEncoder(encoder_layer, num_layers=3)
+        
+        self.classifier = nn.Sequential(
+            nn.Linear(model_dim, 64),
+            nn.ReLU(),
+            nn.Dropout(0.3),
+            nn.Linear(64, n_classes)
+        )
+    
+    def forward(self, x):
+        """
+        x: [batch, seq_len, input_dim] for sequences or [batch, input_dim] for single step
+        """
+        # 检查输入维度，如果是二维则扩展为三维（单步序列）
+        if len(x.shape) == 2:
+            x = x.unsqueeze(1)  # [batch, 1, input_dim]
+        
+        x = self.embedding(x)  # [batch, seq_len, model_dim]
+        memory = self.encoder(x)  # [batch, seq_len, model_dim]
+        
+        # 使用序列所有时间步的平均值
+        seq_avg = torch.mean(memory, dim=1)  # [batch, model_dim]
+        
+        return self.classifier(seq_avg)
+
+# 3. 矫正控制器 (基于train_correction_controller.py)
+class CorrectionController(nn.Module):
+    def __init__(self, input_dim=13, hidden_dim=128, output_dim=3):
+        super(CorrectionController, self).__init__()
+        
+        self.net = nn.Sequential(
+            nn.Linear(input_dim, hidden_dim),
+            nn.ReLU(),
+            nn.Dropout(0.2),
+            nn.Linear(hidden_dim, 64),
+            nn.ReLU(),
+            nn.Linear(64, output_dim)
+        )
+    
+    def forward(self, x):
+        return self.net(x)
+
+# ==================== 数据集类 ====================
+class PrintDataset(Dataset):
+    def __init__(self, data, feature_cols, target_cols=None, mode='predict', seq_len=None):
+        self.data = data[feature_cols].values
+        self.mode = mode
+        self.seq_len = seq_len
+        
+        if target_cols and mode in ['predict', 'correct']:
+            self.targets = data[target_cols].values
+        elif mode == 'classify':
+            self.targets = data['fault_label'].values
+        else:
+            self.targets = None
+            
+    def __len__(self):
+        return len(self.data)
+    
+    def __getitem__(self, idx):
+        features = torch.FloatTensor(self.data[idx])
+        
+        if self.mode == 'classify':
+            label = int(self.targets[idx])
+            return features, label
+        elif self.targets is not None:
+            target = torch.FloatTensor(self.targets[idx])
+            return features, target
+        else:
+            return features, features
+
+# ==================== 加载预训练模型 ====================
+def load_pretrained_models():
+    """加载预训练的模型"""
+    print("\n加载预训练模型...")
+    
+    models = {}
+    
+    # 1. 物理预测模型
+    print("  [1/3] 加载物理预测模型...")
+    physical_model_path = './checkpoints_physical_predictor/best_physical_predictor.pth'
+
+    try:
+        checkpoint = torch.load(physical_model_path, map_location=DEVICE)
+
+        # 获取配置
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+            input_dim = config.get('input_dim', 13)  # 修改默认值为13
+        else:
+            input_dim = 13  # 修改默认值为13
+
+        physical_model = PhysicalPredictor(input_dim=input_dim)
+        
+        # 加载权重
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            # 处理DataParallel包装的权重
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            physical_model.load_state_dict(new_state_dict, strict=False)
+        
+        physical_model = physical_model.to(DEVICE)
+        physical_model.eval()
+        models['physical'] = physical_model
+        print(f"    ✓ 物理预测模型加载成功 (参数量: {sum(p.numel() for p in physical_model.parameters())})")
+        
+    except Exception as e:
+        print(f"    ✗ 物理预测模型加载失败: {e}")
+        print(f"    尝试创建新模型...")
+        physical_model = PhysicalPredictor(input_dim=13).to(DEVICE)  # 修改为13维输入
+        physical_model.eval()
+        models['physical'] = physical_model
+    
+    # 2. 故障分类器
+    print("  [2/3] 加载故障分类器...")
+    fault_model_path = './checkpoints_fault_classifier/best_fault_classifier.pth'
+    
+    try:
+        checkpoint = torch.load(fault_model_path, map_location=DEVICE)
+        
+        fault_model = FaultClassifier(input_dim=8, n_classes=4)
+        
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            fault_model.load_state_dict(new_state_dict, strict=False)
+        
+        fault_model = fault_model.to(DEVICE)
+        fault_model.eval()
+        models['fault'] = fault_model
+        print(f"    ✓ 故障分类器加载成功 (参数量: {sum(p.numel() for p in fault_model.parameters())})")
+        
+    except Exception as e:
+        print(f"    ✗ 故障分类器加载失败: {e}")
+        print(f"    尝试创建新模型...")
+        fault_model = FaultClassifier(input_dim=8, n_classes=4).to(DEVICE)  # 确保使用正确的输入维度
+        fault_model.eval()
+        models['fault'] = fault_model
+    
+    # 3. 矫正控制器
+    print("  [3/3] 加载矫正控制器...")
+    correction_model_path = './checkpoints_correction_controller/best_correction_controller.pth'
+    
+    try:
+        checkpoint = torch.load(correction_model_path, map_location=DEVICE)
+        
+        if 'config' in checkpoint:
+            config = checkpoint['config']
+            input_dim = config.get('input_dim', 13)  # 使用正确的输入维度
+        else:
+            input_dim = 13  # 使用正确的输入维度
+            
+        correction_model = CorrectionController(input_dim=input_dim)
+        
+        if 'model_state_dict' in checkpoint:
+            state_dict = checkpoint['model_state_dict']
+            new_state_dict = {}
+            for k, v in state_dict.items():
+                if k.startswith('module.'):
+                    new_state_dict[k[7:]] = v
+                else:
+                    new_state_dict[k] = v
+            correction_model.load_state_dict(new_state_dict, strict=False)
+        
+        correction_model = correction_model.to(DEVICE)
+        correction_model.eval()
+        models['correction'] = correction_model
+        print(f"    ✓ 矫正控制器加载成功 (参数量: {sum(p.numel() for p in correction_model.parameters())})")
+        
+    except Exception as e:
+        print(f"    ✗ 矫正控制器加载失败: {e}")
+        print(f"    尝试创建新模型...")
+        correction_model = CorrectionController(input_dim=13).to(DEVICE)  # 使用正确的输入维度
+        correction_model.eval()
+        models['correction'] = correction_model
+
+    # 尝试加载标准化参数
+    print("\n加载标准化参数...")
+    norm_params = {}
+    
+    try:
+        with open('./checkpoints_physical_predictor/normalization_params.pkl', 'rb') as f:
+            norm_params['physical'] = pickle.load(f)
+        print("  ✓ 物理预测模型标准化参数加载成功")
+    except:
+        print("  ✗ 物理预测模型标准化参数未找到")
+    
+    try:
+        with open('./checkpoints_correction_controller/correction_params.pkl', 'rb') as f:
+            norm_params['correction'] = pickle.load(f)
+        print("  ✓ 矫正控制器标准化参数加载成功")
+    except:
+        print("  ✗ 矫正控制器标准化参数未找到")
+    
+    return models, norm_params
+
+# ==================== 推理函数 ====================
+def predict_with_model(model, data, mode='predict'):
+    """使用模型进行推理"""
+    model.eval()
+    predictions = []
+    
+    with torch.no_grad():
+        # 分批处理
+        batch_size = 256
+        for i in range(0, len(data), batch_size):
+            batch = torch.FloatTensor(data[i:i+batch_size]).to(DEVICE)
+            
+            if mode in ['predict', 'correct']:
+                outputs = model(batch)
+                predictions.append(outputs.cpu().numpy())
+            else:  # classify
+                outputs = model(batch)
+                pred = torch.argmax(outputs, dim=1)
+                predictions.append(pred.cpu().numpy())
+    
+    return np.concatenate(predictions, axis=0)
+
+# ==================== 主评估流程 ====================
+def main():
+    print("=" * 80)
+    print("基于预训练权重的3D打印质量评估")
+    print("=" * 80)
+    print(f"开始时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+    
+    # ==================== 1. 生成真实仿真数据 ====================
+    print("\n[步骤 1/5] 生成真实物理仿真数据...")
+    simulator = Real3DPrintingSimulator(n_machines=25, n_samples=5000, dt=0.001)
+    df = simulator.simulate()
+    
+    # ==================== 2. 准备数据 ====================
+    print("\n[步骤 2/5] 准备数据...")
+    
+    # 定义特征列
+    predict_feature_cols = [
+        'ctrl_T_target', 'ctrl_speed_set', 'ctrl_pos_x', 'ctrl_pos_y', 'ctrl_pos_z',
+        'temperature_C', 'vibration_disp_x_m', 'vibration_disp_y_m',
+        'vibration_vel_x_m_s', 'vibration_vel_y_m_s',  # 添加缺失的振动速度特征
+        'motor_current_x_A', 'motor_current_y_A', 'pressure_bar'
+    ]
+    predict_target_cols = [
+        'vibration_disp_x_m', 'vibration_disp_y_m',
+        'temperature_C', 'motor_current_x_A', 'motor_current_y_A'
+    ]
+    
+    classify_feature_cols = [
+        'temperature_C', 'vibration_disp_x_m', 'vibration_disp_y_m',
+        'vibration_vel_x_m_s', 'vibration_vel_y_m_s',
+        'motor_current_x_A', 'motor_current_y_A', 'pressure_bar'
+    ]
+    
+    correct_feature_cols = predict_feature_cols
+    
+    # 数据标准化
+    predict_scaler_X = StandardScaler()
+    predict_scaler_y = StandardScaler()
+    classify_scaler_X = StandardScaler()
+    correct_scaler_X = StandardScaler()
+    correct_scaler_y = StandardScaler()
+    
+    df_scaled = df.copy()
+    df_scaled[predict_feature_cols] = predict_scaler_X.fit_transform(df[predict_feature_cols])
+    df_scaled[predict_target_cols] = predict_scaler_y.fit_transform(df[predict_target_cols])
+    df_scaled[classify_feature_cols] = classify_scaler_X.fit_transform(df[classify_feature_cols])
+    df_scaled[correct_feature_cols] = correct_scaler_X.fit_transform(df[correct_feature_cols])
+    
+    # 创建矫正目标
+    df['correction_x_mm'] = (df['x_ideal'] - df['ctrl_pos_x']) * 1000
+    df['correction_y_mm'] = (df['y_ideal'] - df['ctrl_pos_y']) * 1000
+    df['correction_temp_C'] = df['ctrl_T_target'] - df['temperature_C']
+    correct_target_cols = ['correction_x_mm', 'correction_y_mm', 'correction_temp_C']
+    df_scaled[correct_target_cols] = correct_scaler_y.fit_transform(df[correct_target_cols])
+    
+    # 分割测试集
+    test_df = df_scaled.sample(frac=0.2, random_state=42)
+    print(f"  测试集样本数: {len(test_df)}")
+    
+    # ==================== 3. 加载预训练模型 ====================
+    print("\n[步骤 3/5] 加载预训练模型...")
+    models, norm_params = load_pretrained_models()
+    
+    # ==================== 4. 推理 ====================
+    print("\n[步骤 4/5] 进行推理...")
+    
+    # 物理预测推理
+    print("  [1/3] 物理预测推理...")
+    phys_pred = predict_with_model(models['physical'], 
+                                     test_df[predict_feature_cols].values, 
+                                     'predict')
+    phys_target = test_df[predict_target_cols].values
+    
+    # 故障分类推理
+    print("  [2/3] 故障分类推理...")
+    fault_pred = predict_with_model(models['fault'], 
+                                     test_df[classify_feature_cols].values, 
+                                     'classify')
+    fault_target = test_df['fault_label'].values
+    
+    # 矫正控制推理
+    print("  [3/3] 矫正控制推理...")
+    # 只对正常数据进行矫正
+    normal_test_df = test_df[test_df['fault_label'] == 0]
+    corr_pred = predict_with_model(models['correction'], 
+                                   normal_test_df[correct_feature_cols].values, 
+                                   'correct')
+    corr_target = normal_test_df[correct_target_cols].values
+    
+    # ==================== 5. 评估和应用 ====================
+    print("\n[步骤 5/5] 评估和应用...")
+    
+    # 物理预测评估
+    phys_mae = np.mean(np.abs(phys_pred - phys_target), axis=0)
+    phys_mae_labels = ['Vib X', 'Vib Y', 'Temp', 'Current X', 'Current Y']
+    
+    # 故障分类评估
+    fault_accuracy = np.mean(fault_pred == fault_target)
+    fault_report = classification_report(fault_target, fault_pred, output_dict=True, zero_division=0)
+    fault_cm = confusion_matrix(fault_target, fault_pred)
+    
+    # 矫正控制评估
+    corr_mae = np.mean(np.abs(corr_pred - corr_target), axis=0)
+    corr_mae_labels = ['Correction X', 'Correction Y', 'Correction Temp']
+    
+    # 应用矫正
+    print("  应用神经网络矫正...")
+    normal_original_df = test_df[test_df['fault_label'] == 0].copy()
+    
+    # 反标准化
+    corr_pred_original = correct_scaler_y.inverse_transform(corr_pred)
+    
+    # 应用到原始数据
+    corrected_results = []
+    for idx in range(len(normal_original_df)):
+        row_idx = normal_original_df.index[idx]
+        row = df.loc[row_idx]
+        correction = corr_pred_original[idx]
+        
+        # 应用矫正
+        corrected_x = row['ctrl_pos_x'] + correction[0] / 1000
+        corrected_y = row['ctrl_pos_y'] + correction[1] / 1000
+        corrected_temp = row['temperature_C'] + correction[2]
+        
+        corrected_results.append({
+            'x_original': row['ctrl_pos_x'],
+            'y_original': row['ctrl_pos_y'],
+            'x_corrected': corrected_x,
+            'y_corrected': corrected_y,
+            'x_ideal': row['x_ideal'],
+            'y_ideal': row['y_ideal'],
+            'temp_original': row['temperature_C'],
+            'temp_corrected': corrected_temp
+        })
+    
+    corrected_df = pd.DataFrame(corrected_results)
+    
+    # 计算误差
+    original_error = np.sqrt((corrected_df['x_original'] - corrected_df['x_ideal'])**2 + 
+                            (corrected_df['y_original'] - corrected_df['y_ideal'])**2)
+    corrected_error = np.sqrt((corrected_df['x_corrected'] - corrected_df['x_ideal'])**2 + 
+                             (corrected_df['y_corrected'] - corrected_df['y_ideal'])**2)
+    
+    print(f"\n📊 评估结果:")
+    print(f"  物理预测MAE: {dict(zip(phys_mae_labels, phys_mae))}")
+    print(f"  故障分类准确率: {fault_accuracy:.4f}")
+    print(f"  矫正控制MAE: {dict(zip(corr_mae_labels, corr_mae))}")
+    print(f"  位置误差改进: 原始 {original_error.mean():.6f} -> 矫正后 {corrected_error.mean():.6f}")
+    
+    # ==================== 6. 可视化 ====================
+    print("\n[步骤 6/6] 生成可视化结果...")
+    
+    # 创建结果图
+    fig = plt.figure(figsize=(20, 15))
+    gs = GridSpec(4, 4, figure=fig)
+    
+    # 物理预测结果
+    for i, label in enumerate(phys_mae_labels):
+        ax = fig.add_subplot(gs[i//2, i%2])
+        ax.scatter(phys_target[:500, i], phys_pred[:500, i], alpha=0.6, s=10)
+        ax.plot([phys_target[:500, i].min(), phys_target[:500, i].max()], 
+                [phys_target[:500, i].min(), phys_target[:500, i].max()], 'r--', lw=2)
+        ax.set_xlabel('真实值')
+        ax.set_ylabel('预测值')
+        ax.set_title(f'{label} - MAE: {phys_mae[i]:.4f}')
+        ax.grid(True, alpha=0.3)
+    
+    # 故障分类混淆矩阵
+    ax = fig.add_subplot(gs[0, 2:])
+    im = ax.imshow(fault_cm, interpolation='nearest', cmap=plt.cm.Blues)
+    ax.figure.colorbar(im, ax=ax)
+    ax.set(xticks=np.arange(fault_cm.shape[1]),
+           yticks=np.arange(fault_cm.shape[0]),
+           xticklabels=range(4), yticklabels=range(4),
+           title='故障分类混淆矩阵')
+    
+    # 添加混淆矩阵数值
+    thresh = fault_cm.max() / 2.
+    for i in range(fault_cm.shape[0]):
+        for j in range(fault_cm.shape[1]):
+            ax.text(j, i, format(fault_cm[i, j], 'd'),
+                    ha="center", va="center",
+                    color="white" if fault_cm[i, j] > thresh else "black")
+    
+    # 矫正效果
+    ax = fig.add_subplot(gs[1, 2:])
+    ax.hist(original_error, bins=50, alpha=0.5, label='原始误差', density=True)
+    ax.hist(corrected_error, bins=50, alpha=0.5, label='矫正后误差', density=True)
+    ax.set_xlabel('位置误差 (mm)')
+    ax.set_ylabel('密度')
+    ax.set_title('位置误差分布对比')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 矫正前后轨迹对比
+    ax = fig.add_subplot(gs[2, :])
+    ax.plot(corrected_df['x_ideal'][:1000], corrected_df['y_ideal'][:1000], 
+            'g-', label='理想轨迹', linewidth=2)
+    ax.plot(corrected_df['x_original'][:1000], corrected_df['y_original'][:1000], 
+            'r--', label='原始轨迹', alpha=0.7)
+    ax.plot(corrected_df['x_corrected'][:1000], corrected_df['y_corrected'][:1000], 
+            'b-', label='矫正轨迹', alpha=0.7)
+    ax.set_xlabel('X (mm)')
+    ax.set_ylabel('Y (mm)')
+    ax.set_title('轨迹对比 (前1000个点)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    # 矫正前后误差对比
+    ax = fig.add_subplot(gs[3, :])
+    ax.plot(original_error.values[:2000], label='原始误差', alpha=0.7)
+    ax.plot(corrected_error.values[:2000], label='矫正后误差', alpha=0.7)
+    ax.set_xlabel('样本索引')
+    ax.set_ylabel('位置误差 (mm)')
+    ax.set_title('误差对比 (前2000个点)')
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    plt.savefig('pretrained_nn_results.png', dpi=300, bbox_inches='tight')
+    plt.show()
+    
+    # ==================== 7. 生成报告 ====================
+    print("\n[步骤 7/7] 生成评估报告...")
+    
+    with open('pretrained_evaluation_report.txt', 'w', encoding='utf-8') as f:
+        f.write("基于预训练权重的3D打印质量评估报告\n")
+        f.write("="*50 + "\n")
+        f.write(f"评估时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n")
+        
+        f.write("模型配置:\n")
+        f.write(f"  物理预测模型参数: {sum(p.numel() for p in models['physical'].parameters())}\n")
+        f.write(f"  故障分类器参数: {sum(p.numel() for p in models['fault'].parameters())}\n")
+        f.write(f"  矫正控制器参数: {sum(p.numel() for p in models['correction'].parameters())}\n\n")
+        
+        f.write("物理预测结果:\n")
+        for label, mae in zip(phys_mae_labels, phys_mae):
+            f.write(f"  {label}: MAE = {mae:.6f}\n")
+        f.write("\n")
+        
+        f.write("故障分类结果:\n")
+        f.write(f"  准确率: {fault_accuracy:.6f}\n")
+        f.write("  详细分类报告:\n")
+        f.write(classification_report(fault_target, fault_pred, zero_division=0))
+        f.write("\n")
+        
+        f.write("矫正控制结果:\n")
+        for label, mae in zip(corr_mae_labels, corr_mae):
+            f.write(f"  {label}: MAE = {mae:.6f}\n")
+        f.write("\n")
+        
+        f.write("轨迹矫正效果:\n")
+        f.write(f"  平均原始误差: {original_error.mean():.6f} mm\n")
+        f.write(f"  平均矫正后误差: {corrected_error.mean():.6f} mm\n")
+        f.write(f"  误差改进率: {(original_error.mean() - corrected_error.mean()) / original_error.mean() * 100:.2f}%\n")
+    
+    print("✅ 评估完成!")
+    print(f"  - 结果图: pretrained_nn_results.png")
+    print(f"  - 评估报告: pretrained_evaluation_report.txt")
+    print(f"结束时间: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
+
+if __name__ == "__main__":
+    main()
