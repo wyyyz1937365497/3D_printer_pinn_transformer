@@ -1,43 +1,33 @@
-# train_correction_controller.py
+# train_correction_controller_streaming.py
 import torch
 import torch.nn as nn
 import pandas as pd
 import numpy as np
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import IterableDataset, DataLoader
 import os
 import time
 import pickle
 import matplotlib.pyplot as plt
-from sklearn.model_selection import train_test_split
 from torch.optim import AdamW
 from torch.amp import autocast, GradScaler
 import argparse
 from datetime import datetime, timedelta
 
-# 配置matplotlib支持中文字体
-plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'Liberation Sans']
-plt.rcParams['axes.unicode_minus'] = False  # 解决负号显示问题
+plt.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS']
+plt.rcParams['axes.unicode_minus'] = False
 
-# ==================== 配置参数 ====================
 class Config:
     def __init__(self, resume_from=None, gpu_ids=[0]):
-        self.data_path = 'printer_dataset_correction/printer_gear_correction_dataset.csv'
-        self.pred_model_path = './checkpoints_physical_predictor/best_physical_predictor.pth'
+        self.data_dir = 'printer_dataset_correction/'
         self.batch_size = 1024
         self.lr = 3e-4
         self.epochs = 30
         self.gpu_ids = gpu_ids
-        self.resume_from = resume_from  # 添加继续训练的路径
-        if len(gpu_ids) > 1:
-            self.device = f'cuda:{gpu_ids[0]}'  # 主GPU
-        else:
-            self.device = f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu'
-        self.checkpoint_dir = './checkpoints_correction_controller'
-        self.max_samples = 50000
-        self.seq_len = 50  # 短序列，用于实时控制
+        self.resume_from = resume_from
+        self.device = f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu'
+        self.checkpoint_dir = './checkpoints_correction_controller_streaming'
+        self.seq_len = 50
         os.makedirs(self.checkpoint_dir, exist_ok=True)
-        
-        # 特征列
         self.feature_cols = [
             'ctrl_T_target', 'ctrl_speed_set', 'ctrl_pos_x', 'ctrl_pos_y', 'ctrl_pos_z',
             'temperature_C', 'vibration_disp_x_m', 'vibration_disp_y_m',
@@ -45,22 +35,13 @@ class Config:
             'motor_current_x_A', 'motor_current_y_A',
             'pressure_bar'
         ]
-        
-        # 矫正目标列
-        self.correction_cols = [
-            'correction_x_mm', 'correction_y_mm', 'correction_temp_C'
-        ]
-        
+        self.correction_cols = ['correction_x_mm', 'correction_y_mm', 'correction_temp_C']
         self.input_dim = len(self.feature_cols)
         self.output_dim = len(self.correction_cols)
 
-# ==================== 矫正控制器模型 ====================
 class CorrectionController(nn.Module):
     def __init__(self, config):
-        super(CorrectionController, self).__init__()
-        self.config = config
-        
-        # 两层MLP
+        super().__init__()
         self.net = nn.Sequential(
             nn.Linear(config.input_dim, 128),
             nn.ReLU(),
@@ -71,126 +52,119 @@ class CorrectionController(nn.Module):
         )
     
     def forward(self, x):
-        # x: [batch, input_dim]
         return self.net(x)
 
-# ==================== 数据集类 ====================
-class CorrectionDataset(Dataset):
-    def __init__(self, features, corrections):
-        self.features = torch.tensor(features, dtype=torch.float32)
-        self.corrections = torch.tensor(corrections, dtype=torch.float32)
-    
-    def __len__(self):
-        return len(self.features)
-    
-    def __getitem__(self, idx):
-        return self.features[idx], self.corrections[idx]
-
-# ==================== 数据处理器 ====================
-def prepare_correction_data(config):
-    print("🔄 加载矫正数据...")
-    df = pd.read_csv(config.data_path)
-    
-    # 选择正常机器但有矫正信号的数据
-    normal_df = df[df['fault_label'] == 0].copy()
-    
-    # 我们只关心振动较大的区域（需要矫正的地方）
-    normal_df = normal_df[normal_df['vibration_disp_x_m'].abs() + normal_df['vibration_disp_y_m'].abs() > 0.0005]
-    
-    print(f"   有效矫正样本: {len(normal_df)}")
-    
-    # 采样
-    if len(normal_df) > config.max_samples:
-        normal_df = normal_df.sample(n=config.max_samples, random_state=42)
-        print(f"   采样后样本数: {len(normal_df)}")
-    
-    # 提取特征和矫正目标
-    features = normal_df[config.feature_cols].values
-    corrections = normal_df[config.correction_cols].values
-    
-    # 从物理预测模型加载标准化参数
-    norm_params_path = './checkpoints_physical_predictor/normalization_params.pkl'
-    if os.path.exists(norm_params_path):
-        with open(norm_params_path, 'rb') as f:
-            norm_params = pickle.load(f)
+class StreamingCorrectionDataset(IterableDataset):
+    def __init__(self, data_dir, config, split='train', val_ratio=0.2, norm_params=None):
+        self.data_dir = data_dir
+        self.config = config
+        self.split = split
+        self.val_ratio = val_ratio
+        self.files = sorted([os.path.join(data_dir, f) for f in os.listdir(data_dir) 
+                           if f.startswith('machine_') and f.endswith('.csv')])
         
-        feature_mean = norm_params['feature_mean']
-        feature_std = norm_params['feature_std']
-        features_norm = (features - feature_mean) / feature_std
-        print("✅ 使用物理预测模型的标准化参数")
-    else:
-        # 如果没有，自己计算
-        feature_mean = features.mean(axis=0)
-        feature_std = features.std(axis=0)
-        feature_std[feature_std < 1e-8] = 1.0
-        features_norm = (features - feature_mean) / feature_std
+        # 加载标准化参数
+        if norm_params is None:
+            self._load_norm_params()
+        else:
+            self.feature_mean = norm_params['feature_mean']
+            self.feature_std = norm_params['feature_std']
+            self.correction_mean = norm_params.get('correction_mean', np.zeros(len(config.correction_cols)))
+            self.correction_std = norm_params.get('correction_std', np.ones(len(config.correction_cols)))
     
-    # 目标标准化
-    correction_mean = corrections.mean(axis=0)
-    correction_std = corrections.std(axis=0)
-    correction_std[correction_std < 1e-8] = 1.0
-    corrections_norm = (corrections - correction_mean) / correction_std
+    def _load_norm_params(self):
+        path = './checkpoints_physical_predictor_streaming/normalization_params.pkl'
+        if os.path.exists(path):
+            with open(path, 'rb') as f:
+                params = pickle.load(f)
+                self.feature_mean = params['feature_mean']
+                self.feature_std = params['feature_std']
+        else:
+            raise FileNotFoundError("请先训练物理预测模型以获取标准化参数")
+        
+        # 尝试加载矫正参数
+        correction_path = './checkpoints_correction_controller_streaming/correction_params.pkl'
+        if os.path.exists(correction_path):
+            with open(correction_path, 'rb') as f:
+                corr_params = pickle.load(f)
+                self.correction_mean = corr_params['correction_mean']
+                self.correction_std = corr_params['correction_std']
+        else:
+            # 估算
+            self.correction_mean = np.array([0.0, 0.0, 0.0])
+            self.correction_std = np.array([0.01, 0.01, 10.0])
     
-    # 保存矫正标准化参数
-    correction_params = {
-        'correction_mean': correction_mean,
-        'correction_std': correction_std,
-        'correction_cols': config.correction_cols
-    }
+    def _process_file(self, filepath):
+        df = pd.read_csv(filepath)
+        normal_df = df[df['fault_label'] == 0]
+        # 只保留振动幅度大于阈值的样本（需要矫正的区域）
+        mask = (normal_df['vibration_disp_x_m'].abs() + normal_df['vibration_disp_y_m'].abs()) > 0.0005
+        normal_df = normal_df[mask]
+        
+        if len(normal_df) == 0:
+            return
+        
+        features = normal_df[self.config.feature_cols].values
+        corrections = normal_df[self.config.correction_cols].values
+        
+        features = (features - self.feature_mean) / self.feature_std
+        corrections = (corrections - self.correction_mean) / self.correction_std
+        
+        indices = np.arange(len(features))
+        val_size = int(len(indices) * self.val_ratio)
+        
+        if self.split == 'train':
+            indices = indices[:-val_size] if val_size > 0 else indices
+        else:
+            indices = indices[-val_size:] if val_size > 0 else []
+        
+        for i in indices:
+            yield torch.from_numpy(features[i].astype(np.float32)), torch.from_numpy(corrections[i].astype(np.float32))
     
-    with open(os.path.join(config.checkpoint_dir, 'correction_params.pkl'), 'wb') as f:
-        pickle.dump(correction_params, f)
-    
-    # 分割数据集
-    train_feat, val_feat, train_corr, val_corr = train_test_split(
-        features_norm, corrections_norm, test_size=0.2, random_state=42
-    )
-    
-    print(f"📊 总样本数: {len(features_norm)}")
-    print(f"   训练集: {len(train_feat)}, 验证集: {len(val_feat)}")
-    
-    return (train_feat, train_corr), (val_feat, val_corr), correction_params
+    def __iter__(self):
+        worker_info = torch.utils.data.get_worker_info()
+        if worker_info is None:
+            for f in self.files:
+                yield from self._process_file(f)
+        else:
+            worker_id = worker_info.id
+            num_workers = worker_info.num_workers
+            files_per_worker = len(self.files) // num_workers
+            start_idx = worker_id * files_per_worker
+            end_idx = start_idx + files_per_worker if worker_id < num_workers - 1 else len(self.files)
+            
+            for f in self.files[start_idx:end_idx]:
+                yield from self._process_file(f)
 
-# ==================== 训练函数 ====================
 def train_correction_controller(config):
     print("=" * 80)
-    print("🚀 训练矫正控制器")
+    print("🚀 训练流式矫正控制器")
     print("=" * 80)
     
-    # 准备数据
-    (train_feat, train_corr), (val_feat, val_corr), corr_params = prepare_correction_data(config)
-    
-    # 创建数据集和数据加载器
-    train_dataset = CorrectionDataset(train_feat, train_corr)
-    val_dataset = CorrectionDataset(val_feat, val_corr)
+    # 创建数据集
+    train_dataset = StreamingCorrectionDataset(config.data_dir, config, split='train')
+    val_dataset = StreamingCorrectionDataset(config.data_dir, config, split='val')
     
     train_loader = DataLoader(
         train_dataset,
         batch_size=config.batch_size,
-        shuffle=True,
         num_workers=4,
-        pin_memory=True
+        pin_memory=True,
+        prefetch_factor=2
     )
-    
     val_loader = DataLoader(
         val_dataset,
         batch_size=config.batch_size,
-        shuffle=False,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True
     )
     
     # 创建模型
-    model = CorrectionController(config)
-    print(f"✅ 模型创建完成 | 参数量: {sum(p.numel() for p in model.parameters())}")
-    
-    # 检查是否使用多GPU
+    model = CorrectionController(config).to(config.device)
     if len(config.gpu_ids) > 1:
-        print(f"✅ 使用多GPU训练: {config.gpu_ids}")
         model = nn.DataParallel(model, device_ids=config.gpu_ids)
-        model = model.to(config.device)
-    else:
-        model = model.to(config.device)
+    
+    print(f"✅ 模型创建完成 | 参数量: {sum(p.numel() for p in model.parameters()):,}")
     
     # 优化器
     optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
@@ -198,11 +172,10 @@ def train_correction_controller(config):
         optimizer, mode='min', factor=0.5, patience=3
     )
     
-    # 损失函数
     criterion = nn.MSELoss()
     scaler = GradScaler('cuda')
     
-    # 从检查点恢复训练
+    # 恢复训练
     start_epoch = 0
     best_val_loss = float('inf')
     train_losses = []
@@ -210,11 +183,14 @@ def train_correction_controller(config):
     
     if config.resume_from and os.path.exists(config.resume_from):
         print(f"🔄 从检查点恢复训练: {config.resume_from}")
-        checkpoint = torch.load(config.resume_from)
+        checkpoint = torch.load(config.resume_from, map_location=config.device)
+        model_state = checkpoint['model_state_dict']
+        
         if isinstance(model, nn.DataParallel):
-            model.module.load_state_dict(checkpoint['model_state_dict'])
+            model.module.load_state_dict(model_state)
         else:
-            model.load_state_dict(checkpoint['model_state_dict'])
+            model.load_state_dict(model_state)
+        
         optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
         scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
         start_epoch = checkpoint['epoch']
@@ -222,7 +198,7 @@ def train_correction_controller(config):
         train_losses = checkpoint.get('train_losses', [])
         val_losses = checkpoint.get('val_losses', [])
         print(f"✅ 恢复训练成功 | 从第 {start_epoch} 个epoch开始")
-
+    
     print("\n🔥 开始训练矫正控制器...")
     print("-" * 80)
     
@@ -261,11 +237,9 @@ def train_correction_controller(config):
         
         avg_val_loss = val_loss / len(val_loader)
         val_losses.append(avg_val_loss)
-        
         scheduler.step(avg_val_loss)
-        epoch_time = time.time() - epoch_start
         
-        # 计算剩余时间
+        epoch_time = time.time() - epoch_start
         elapsed_time = time.time() - epoch_start
         remaining_epochs = config.epochs - epoch - 1
         remaining_time = elapsed_time * remaining_epochs
@@ -304,8 +278,7 @@ def train_correction_controller(config):
     plt.title('矫正控制器训练过程')
     plt.legend()
     plt.grid(True)
-    plt.savefig(os.path.join(config.checkpoint_dir, 'correction_training_curve.png'), 
-                bbox_inches='tight', dpi=300, facecolor='white')
+    plt.savefig(os.path.join(config.checkpoint_dir, 'correction_training_curve.png'))
     
     print("\n" + "=" * 80)
     print(f"🎉 矫正控制器训练完成! 最佳验证损失: {best_val_loss:.6f}")
@@ -313,11 +286,11 @@ def train_correction_controller(config):
 
 # ==================== 主函数 ====================
 if __name__ == "__main__":
-    parser = argparse.ArgumentParser(description='训练矫正控制器')
+    parser = argparse.ArgumentParser(description='训练流式矫正控制器')
     parser.add_argument('--resume', type=str, default=None, help='从指定路径恢复训练')
     parser.add_argument('--gpu_ids', type=str, default='0,1', help='GPU IDs (例如: "0,1,2,3")')
     args = parser.parse_args()
-    
     gpu_ids = [int(id) for id in args.gpu_ids.split(',')]
+    
     config = Config(resume_from=args.resume, gpu_ids=gpu_ids)
     train_correction_controller(config)
