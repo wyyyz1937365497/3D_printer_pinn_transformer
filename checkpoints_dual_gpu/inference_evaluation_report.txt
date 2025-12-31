@@ -1,0 +1,24 @@
+3D打印机PINN-Transformer模型推理评估报告
+============================================================
+评估时间: 2025-12-31 11:00:28
+模型路径: F:\AI\3D_printer_pinn_transformer\checkpoints_dual_gpu/best_multitask_model.pth
+数据样本数: 9752
+
+关键性能指标摘要:
+----------------------------------------
+1. 物理场重构性能:
+   temperature_C       : RMSE = 0.635149
+   vibration_disp_x_m  : RMSE = 0.016931
+   vibration_disp_y_m  : RMSE = 0.016737
+
+2. 故障分类性能:
+   准确率: 1.0000
+
+3. RUL预测性能:
+   RMSE: 48.38 秒
+
+============================================================
+详细结果请查看生成的图像文件:
+   - physics_reconstruction.png
+   - inference_confusion_matrix.png
+   - rul_prediction_comparison.png

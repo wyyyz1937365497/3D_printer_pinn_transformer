@@ -317,19 +317,52 @@ class NozzleInferenceEvaluator:
         accuracy = np.mean(pred_classes == true_classes)
         
         print(f"   准确率: {accuracy:.4f}")
-        print("\n" + classification_report(true_classes, pred_classes, 
-                                          target_names=['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault']))
+        
+        # 动态获取实际存在的类别
+        unique_true_classes = np.unique(true_classes)
+        unique_pred_classes = np.unique(pred_classes)
+        all_classes = np.union1d(unique_true_classes, unique_pred_classes)
+        
+        # 如果只有一种类别，不能生成分类报告，需要特殊处理
+        if len(all_classes) <= 1:
+            print(f"   只存在 {len(all_classes)} 种类别，无法生成分类报告。")
+            print(f"   所有样本都属于类别 {all_classes[0]}")
+        else:
+            # 定义所有可能的类别标签名
+            all_target_names = ['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault']
+            # 根据实际存在的类别选择对应的标签名
+            actual_target_names = [all_target_names[i] for i in all_classes if i < len(all_target_names)]
+            
+            print("\n" + classification_report(true_classes, pred_classes, 
+                                              labels=all_classes,
+                                              target_names=actual_target_names))
+        
+        # 设置matplotlib支持中文字体
+        import matplotlib
+        matplotlib.rcParams['font.sans-serif'] = ['SimHei', 'DejaVu Sans', 'Arial Unicode MS', 'Liberation Sans']
+        matplotlib.rcParams['axes.unicode_minus'] = False  # 正常显示负号
         
         # 混淆矩阵
         cm = confusion_matrix(true_classes, pred_classes)
         plt.figure(figsize=(10, 8))
+        # 为混淆矩阵也使用实际的标签
+        all_target_names = ['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault']
+        actual_xticklabels = [all_target_names[i] for i in range(len(all_target_names)) if i in np.unique(np.concatenate([true_classes, pred_classes]))]
+        actual_yticklabels = [all_target_names[i] for i in range(len(all_target_names)) if i in np.unique(np.concatenate([true_classes, pred_classes]))]
+        # 如果标签列表为空或长度不正确，使用默认标签
+        if len(actual_xticklabels) == 0 or len(actual_yticklabels) == 0:
+            actual_xticklabels = ['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault']
+            actual_yticklabels = ['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault']
         sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                    xticklabels=['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault'],
-                    yticklabels=['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault'])
+                    xticklabels=all_target_names,
+                    yticklabels=all_target_names)
         plt.title('故障分类混淆矩阵')
         plt.xlabel('预测类别')
         plt.ylabel('真实类别')
-        plt.savefig(os.path.join(self.config.checkpoint_dir, 'inference_confusion_matrix.png'))
+        plt.savefig(os.path.join(self.config.checkpoint_dir, 'inference_confusion_matrix.png'), 
+                    bbox_inches='tight', 
+                    dpi=300, 
+                    facecolor='white')
         plt.close()
         
         print(f"   混淆矩阵已保存: {os.path.join(self.config.checkpoint_dir, 'inference_confusion_matrix.png')}")
