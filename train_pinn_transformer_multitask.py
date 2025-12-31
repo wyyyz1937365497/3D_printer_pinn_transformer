@@ -28,10 +28,10 @@ os.environ["NCCL_P2P_DISABLE"] = "1"         # Windows下NCCL优化
 os.environ["CUDA_LAUNCH_BLOCKING"] = "0"     # 非阻塞模式
 
 # 检查GPU可用性
-print(f"可用GPU数量: {torch.cuda.device_count()}")
-for i in range(torch.cuda.device_count()):
-    print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
-    print(f"  显存: {torch.cuda.get_device_properties(i).total_memory/1024**3:.1f}GB")
+# print(f"可用GPU数量: {torch.cuda.device_count()}")
+# for i in range(torch.cuda.device_count()):
+#     print(f"GPU {i}: {torch.cuda.get_device_name(i)}")
+#     print(f"  显存: {torch.cuda.get_device_properties(i).total_memory/1024**3:.1f}GB")
 
 
 # ==================== 配置参数 ====================
@@ -51,7 +51,7 @@ class Config:
         self.epochs = 50
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
         self.num_workers = 4
-        self.max_samples = 100000
+        self.max_samples = 500000
         self.lambda_physics = 0.1   # 物理损失权重
         self.lambda_classification = 1.0  # 分类损失权重
         self.lambda_rul = 0.5       # RUL损失权重
@@ -189,50 +189,69 @@ class PrinterPINN_MultiTask(nn.Module):
         
         # 1. 热传导方程约束（温度变化应平滑）
         temp_pred = physics_pred[:, :, 0]  # temperature_C
-        dT_dt = torch.diff(temp_pred, dim=1) / 0.001  # 1ms步长
-        d2T_dt2 = torch.diff(dT_dt, dim=1) / 0.001
-        
-        # 温度加速度应有限（避免不合理的剧烈变化）
-        thermal_loss = torch.mean(torch.abs(d2T_dt2))
-        loss += thermal_loss
+        if seq_len > 1:
+            dT_dt = torch.diff(temp_pred, dim=1) / 0.001  # 1ms步长
+            if dT_dt.shape[1] > 1:  # 确保有足够的元素进行二次微分
+                d2T_dt2 = torch.diff(dT_dt, dim=1) / 0.001
+                # 温度加速度应有限（避免不合理的剧烈变化）
+                thermal_loss = torch.mean(torch.abs(d2T_dt2))
+                # 添加阈值防止无穷大
+                thermal_loss = torch.clamp(thermal_loss, max=1e3)
+                loss += thermal_loss
         
         # 2. 振动动力学约束（质量-弹簧-阻尼系统）
-        disp_x_pred = physics_pred[:, :, 1]  # vibration_disp_x_m
-        disp_y_pred = physics_pred[:, :, 2]  # vibration_disp_y_m
-        vel_x_pred = physics_pred[:, :, 3]   # vibration_vel_x_m_s
-        vel_y_pred = physics_pred[:, :, 4]   # vibration_vel_y_m_s
-        
-        # 从位移计算速度（应与预测的速度一致）
-        dt = 0.001  # 1ms
-        vel_x_from_disp = torch.diff(disp_x_pred, dim=1) / dt
-        vel_y_from_disp = torch.diff(disp_y_pred, dim=1) / dt
-        
-        # 速度一致性损失
-        vibration_loss = torch.mean((vel_x_from_disp - vel_x_pred[:, :-1])**2) + \
-                        torch.mean((vel_y_from_disp - vel_y_pred[:, :-1])**2)
-        loss += vibration_loss
+        if seq_len > 1:
+            disp_x_pred = physics_pred[:, :, 1]  # vibration_disp_x_m
+            disp_y_pred = physics_pred[:, :, 2]  # vibration_disp_y_m
+            vel_x_pred = physics_pred[:, :, 3]   # vibration_vel_x_m_s
+            vel_y_pred = physics_pred[:, :, 4]   # vibration_vel_y_m_s
+            
+            # 从位移计算速度（应与预测的速度一致）
+            dt = 0.001  # 1ms
+            if disp_x_pred.shape[1] > 1 and disp_y_pred.shape[1] > 1:
+                vel_x_from_disp = torch.diff(disp_x_pred, dim=1) / dt
+                vel_y_from_disp = torch.diff(disp_y_pred, dim=1) / dt
+                
+                # 速度一致性损失
+                vibration_loss = torch.mean((vel_x_from_disp - vel_x_pred[:, :-1])**2) + \
+                                torch.mean((vel_y_from_disp - vel_y_pred[:, :-1])**2)
+                # 添加阈值防止无穷大
+                vibration_loss = torch.clamp(vibration_loss, max=1e3)
+                loss += vibration_loss
         
         # 3. 能量守恒约束（简化的）
-        kinetic_energy = vel_x_pred**2 + vel_y_pred**2
-        d_energy_dt = torch.diff(kinetic_energy, dim=1) / dt
-        energy_loss = torch.mean(torch.abs(d_energy_dt))
-        loss += 0.1 * energy_loss
+        if seq_len > 1:
+            vel_x_pred = physics_pred[:, :, 3]   # vibration_vel_x_m_s
+            vel_y_pred = physics_pred[:, :, 4]   # vibration_vel_y_m_s
+            kinetic_energy = vel_x_pred**2 + vel_y_pred**2
+            if kinetic_energy.shape[1] > 1:
+                d_energy_dt = torch.diff(kinetic_energy, dim=1) / dt
+                energy_loss = torch.mean(torch.abs(d_energy_dt))
+                # 添加阈值防止无穷大
+                energy_loss = torch.clamp(energy_loss, max=1e2)
+                loss += 0.1 * energy_loss
         
         # 4. 电机电流-振动耦合约束
-        current_x_pred = physics_pred[:, :, 5]  # motor_current_x_A
-        current_y_pred = physics_pred[:, :, 6]  # motor_current_y_A
-        
-        # 电流应与加速度相关（F=ma，而F与电流成正比）
-        accel_x_pred = torch.diff(vel_x_pred, dim=1) / dt
-        accel_y_pred = torch.diff(vel_y_pred, dim=1) / dt
-        
-        current_accel_corr_x = torch.mean(current_x_pred[:, :-1] * accel_x_pred)
-        current_accel_corr_y = torch.mean(current_y_pred[:, :-1] * accel_y_pred)
-        
-        # 确保相关性合理（避免完全不相关的预测）
-        coupling_loss = torch.abs(1.0 - torch.abs(current_accel_corr_x)) + \
-                       torch.abs(1.0 - torch.abs(current_accel_corr_y))
-        loss += 0.2 * coupling_loss
+        if seq_len > 1:
+            current_x_pred = physics_pred[:, :, 5]  # motor_current_x_A
+            current_y_pred = physics_pred[:, :, 6]  # motor_current_y_A
+            
+            # 电流应与加速度相关（F=ma，而F与电流成正比）
+            dt = 0.001  # 1ms
+            if vel_x_pred.shape[1] > 1 and vel_y_pred.shape[1] > 1:
+                accel_x_pred = torch.diff(vel_x_pred, dim=1) / dt
+                accel_y_pred = torch.diff(vel_y_pred, dim=1) / dt
+                
+                if accel_x_pred.shape[1] > 0 and accel_y_pred.shape[1] > 0:
+                    current_accel_corr_x = torch.mean(current_x_pred[:, :-1] * accel_x_pred)
+                    current_accel_corr_y = torch.mean(current_y_pred[:, :-1] * accel_y_pred)
+                    
+                    # 确保相关性合理（避免完全不相关的预测）
+                    coupling_loss = torch.abs(1.0 - torch.abs(current_accel_corr_x)) + \
+                                   torch.abs(1.0 - torch.abs(current_accel_corr_y))
+                    # 添加阈值防止无穷大
+                    coupling_loss = torch.clamp(coupling_loss, max=1e2)
+                    loss += 0.2 * coupling_loss
         
         return loss
 
@@ -609,6 +628,9 @@ def train_multitask_pinn(config):
     print("\n🚀 开始多任务训练...")
     print(f"{'='*80}")
     
+    # 记录每个epoch的时间，用于预测剩余时间
+    epoch_times = []
+    
     for epoch in range(start_epoch, config.epochs):
         epoch_start = time.time()
         model.train()
@@ -651,13 +673,27 @@ def train_multitask_pinn(config):
                 rul_loss = rul_criterion(outputs['rul_pred'].squeeze(), y_rul)
                 
                 # 4. 物理约束损失
-                physics_constraint_loss = model.physics_loss(outputs, y_state, config.device)
+                # 解决DataParallel无法访问自定义方法的问题
+                if isinstance(model, nn.DataParallel):
+                    physics_constraint_loss = model.module.physics_loss(outputs, y_state, config.device)
+                else:
+                    physics_constraint_loss = model.physics_loss(outputs, y_state, config.device)
+                
+                # 防止物理约束损失为无穷大或NaN
+                if torch.isnan(physics_constraint_loss) or torch.isinf(physics_constraint_loss):
+                    print(f"⚠️  检测到物理约束损失异常: {physics_constraint_loss}")
+                    physics_constraint_loss = torch.tensor(0.0, device=physics_constraint_loss.device, dtype=physics_constraint_loss.dtype)
                 
                 # 总损失
                 total_loss = (physics_loss + 
                              config.lambda_classification * class_loss + 
                              config.lambda_rul * rul_loss + 
                              config.lambda_physics * physics_constraint_loss)
+                
+                # 检查总损失是否正常
+                if torch.isnan(total_loss) or torch.isinf(total_loss):
+                    print(f"⚠️  检测到总损失异常: {total_loss}")
+                    continue  # 跳过这个批次
             
             # 反向传播 - 使用scaler进行缩放
             scaler.scale(total_loss).backward()
@@ -732,7 +768,16 @@ def train_multitask_pinn(config):
                     rul_loss = rul_criterion(outputs['rul_pred'].squeeze(), y_rul)
                     
                     # 物理约束
-                    physics_term = model.physics_loss(outputs, y_state, config.device)
+                    # 解决DataParallel无法访问自定义方法的问题
+                    if isinstance(model, nn.DataParallel):
+                        physics_term = model.module.physics_loss(outputs, y_state, config.device)
+                    else:
+                        physics_term = model.physics_loss(outputs, y_state, config.device)
+                    
+                    # 检查物理项是否为异常值
+                    if torch.isnan(physics_term) or torch.isinf(physics_term):
+                        print(f"⚠️  验证期间检测到物理约束损失异常: {physics_term}")
+                        physics_term = torch.tensor(0.0, device=physics_term.device, dtype=physics_term.dtype)
                 
                 val_physics_loss += physics_loss.item()
                 val_class_loss += class_loss.item()
@@ -744,6 +789,20 @@ def train_multitask_pinn(config):
                 all_preds.extend(predicted.cpu().numpy())
                 all_labels.extend(class_labels.cpu().numpy())
         
+        # 计算当前epoch耗时
+        epoch_time = time.time() - epoch_start
+        epoch_times.append(epoch_time)
+        
+        # 计算平均epoch时间并预测剩余时间
+        avg_epoch_time = sum(epoch_times) / len(epoch_times)
+        remaining_epochs = config.epochs - (epoch + 1)
+        remaining_time = avg_epoch_time * remaining_epochs
+        
+        # 将剩余时间转换为小时、分钟、秒
+        hours = int(remaining_time // 3600)
+        minutes = int((remaining_time % 3600) // 60)
+        seconds = int(remaining_time % 60)
+        
         # 计算平均验证损失
         avg_val_physics = val_physics_loss / len(val_loader)
         avg_val_class = val_class_loss / len(val_loader)
@@ -752,11 +811,9 @@ def train_multitask_pinn(config):
         
         total_val_loss = avg_val_physics + config.lambda_classification * avg_val_class + \
                         config.lambda_rul * avg_val_rul + config.lambda_physics * avg_val_physics_term
-        
-        epoch_time = time.time() - epoch_start
-        
+
         # 打印epoch摘要
-        print(f"🟢 Epoch {epoch+1:2d}/{config.epochs} | Time: {epoch_time:.2f}s")
+        print(f"🟢 Epoch {epoch+1:2d}/{config.epochs} | Time: {epoch_time:.2f}s | ETA: {hours:02d}h {minutes:02d}m {seconds:02d}s")
         print(f"   Train - Physics: {total_physics_loss/len(train_loader):.4f} | "
               f"Class: {total_class_loss/len(train_loader):.4f} | "
               f"RUL: {total_rul_loss/len(train_loader):.4f} | "
@@ -768,17 +825,49 @@ def train_multitask_pinn(config):
               f"Total: {total_val_loss:.4f}")
         
         # 分类性能评估
-        if len(all_preds) > 0:
+        if len(all_preds) > 0 and len(set(all_labels)) > 1:  # 确保至少有两个不同的标签
             print("\n📊 分类报告:")
-            print(classification_report(all_labels, all_preds, 
-                                      target_names=['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault']))
+            # 检查实际的标签数量，只显示实际存在的类别
+            unique_labels = sorted(set(all_labels))
+            if len(unique_labels) > 1:  # 确保有多个类别
+                target_names_map = {
+                    0: 'Normal', 
+                    1: 'Nozzle Clog', 
+                    2: 'Mechanical Loose', 
+                    3: 'Motor Fault'
+                }
+                actual_target_names = [target_names_map[i] for i in unique_labels if i in target_names_map]
+                
+                print(classification_report(
+                    all_labels, 
+                    all_preds, 
+                    labels=unique_labels,
+                    target_names=actual_target_names
+                ))
+            else:
+                print(f"⚠️  只有一个类别被预测，无法生成分类报告。唯一标签: {unique_labels[0]}")
             
             # 绘制混淆矩阵
             plt.figure(figsize=(8, 6))
             cm = confusion_matrix(all_labels, all_preds)
-            sns.heatmap(cm, annot=True, fmt='d', cmap='Blues',
-                       xticklabels=['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault'],
-                       yticklabels=['Normal', 'Nozzle Clog', 'Mechanical Loose', 'Motor Fault'])
+            # 确保标签顺序正确
+            unique_all = sorted(set(all_labels + all_preds))
+            target_names_map = {
+                0: 'Normal', 
+                1: 'Nozzle Clog', 
+                2: 'Mechanical Loose', 
+                3: 'Motor Fault'
+            }
+            tick_labels = [target_names_map.get(i, f'Class {i}') for i in unique_all]
+            
+            sns.heatmap(
+                cm, 
+                annot=True, 
+                fmt='d', 
+                cmap='Blues',
+                xticklabels=tick_labels,
+                yticklabels=tick_labels
+            )
             plt.title(f'Confusion Matrix - Epoch {epoch+1}')
             plt.xlabel('Predicted')
             plt.ylabel('True')
@@ -788,6 +877,8 @@ def train_multitask_pinn(config):
             plt.close()
             
             print(f"   混淆矩阵已保存: {cm_path}")
+        else:
+            print(f"⚠️  Epoch {epoch+1}: 无法生成分类报告，预测数据不足或类别不全")
         
         # TensorBoard记录
         writer.add_scalar("Loss/train_physics", total_physics_loss/len(train_loader), epoch)
@@ -857,7 +948,7 @@ def get_args():
     parser.add_argument('--data_path', type=str, default='printer_dataset/nozzle_simulation_gear_print.csv',
                         help='数据文件路径')
     parser.add_argument('--epochs', type=int, default=50, help='训练轮数')
-    parser.add_argument('--batch_size', type=int, default=128, help='批次大小')
+    parser.add_argument('--batch_size', type=int, default=2048, help='批次大小')
     parser.add_argument('--lr', type=float, default=1e-4, help='学习率')
     parser.add_argument('--resume_from', type=str, help='从指定检查点恢复训练')
     parser.add_argument('--checkpoint_dir', type=str, default='./checkpoints_multitask', help='检查点保存目录')

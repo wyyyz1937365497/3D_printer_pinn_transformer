@@ -22,7 +22,7 @@ class NozzleInferenceEvaluator:
         
         # 加载模型
         self.model, self.config = self.load_model(model_path, config_path)
-        
+        self.config.checkpoint_dir = os.path.dirname(model_path)
         # 加载归一化参数
         self.load_normalization_params()
         
@@ -45,7 +45,19 @@ class NozzleInferenceEvaluator:
         
         # 加载模型权重
         checkpoint = torch.load(model_path, map_location='cpu')
-        model.load_state_dict(checkpoint['model_state_dict'])
+        
+        # 处理DataParallel保存的模型参数
+        state_dict = checkpoint['model_state_dict']
+        # 如果模型是用DataParallel保存的，需要移除module.前缀
+        new_state_dict = {}
+        for key, value in state_dict.items():
+            if key.startswith('module.'):
+                new_key = key[7:]  # 移除'module.'前缀
+                new_state_dict[new_key] = value
+            else:
+                new_state_dict[key] = value
+                
+        model.load_state_dict(new_state_dict)
         
         model = model.to(self.device)
         model.eval()
@@ -67,8 +79,9 @@ class NozzleInferenceEvaluator:
             self.state_cols = params['state_cols']
             
             print("📊 归一化参数加载成功")
-            print(f"   平均值: {self.mean_X}")
-            print(f"   标准差: {self.std_X}")
+            print(f"   平均值: {self.mean_X.shape}")
+            print(f"   标准差: {self.std_X.shape}")
+            print(f"   控制列: {len(self.ctrl_cols)}, 状态列: {len(self.state_cols)}")
         else:
             raise FileNotFoundError(f"归一化参数文件不存在: {params_path}")
     
@@ -88,11 +101,50 @@ class NozzleInferenceEvaluator:
         
         # 选择需要的列
         all_cols = self.ctrl_cols + self.state_cols
-        if 'hour' in data_df.columns:
-            all_cols.append('hour')
+        cols_to_use = all_cols.copy()
+        has_hour_feature = 'hour' in data_df.columns and 'hour' not in cols_to_use
+        if has_hour_feature:
+            cols_to_use.append('hour')
         
-        # 提取数据
-        data_array = data_df[all_cols].values.astype(np.float32)
+        # 检查维度是否匹配
+        expected_features = len(self.mean_X)
+        actual_features = len(all_cols)  # 使用原始列数检查
+        
+        # 如果期望的特征数比现有特征多1个，且原始数据中没有hour特征
+        if actual_features + 1 == expected_features and not has_hour_feature:
+            # 模型训练时使用了hour特征，但当前数据中没有
+            print(f"⚠️  模型期望 'hour' 特征，但当前数据中缺少此特征...")
+            # 检查是否有timestamp列可以用来创建hour特征
+            if 'timestamp' in data_df.columns:
+                print("📊 从timestamp列创建'hour'特征...")
+                # 创建包含hour列的新数据框
+                data_with_hour = data_df.copy()
+                # 从timestamp列提取小时
+                data_with_hour['hour'] = pd.to_datetime(data_with_hour['timestamp']).dt.hour
+                cols_to_use.append('hour')  # 添加hour列到特征列表
+                # 使用包含hour的数据
+                data_array = data_with_hour[cols_to_use].values.astype(np.float32)
+                
+                print(f"✅ 成功从时间戳创建 'hour' 特征")
+            else:
+                print(f"❌ 数据中没有'timestamp'列，无法创建'hour'特征")
+                raise ValueError(f"特征数量不匹配：模型期望 {expected_features} 个特征，但数据只有 {actual_features} 个特征")
+        elif actual_features == expected_features and has_hour_feature:
+            # 数据中已有hour特征且数量匹配
+            data_array = data_df[cols_to_use].values.astype(np.float32)
+        elif actual_features == expected_features and not has_hour_feature:
+            # 特征数量匹配且不包含hour特征
+            data_array = data_df[cols_to_use].values.astype(np.float32)
+        else:
+            # 其他不匹配的情况
+            print(f"⚠️  特征数量不匹配: 数据有 {actual_features} 个基础特征，但归一化参数适用于 {expected_features} 个特征")
+            print(f"   预期特征: {expected_features} (ctrl: {len(self.ctrl_cols)}, state: {len(self.state_cols)}" + (", hour" if expected_features > len(self.ctrl_cols) + len(self.state_cols) else "") + ")")
+            print(f"   实际特征: {actual_features} (cols: {cols_to_use})")
+            raise ValueError(f"特征数量不匹配，请检查数据和归一化参数")
+        
+        # 确保维度匹配
+        if data_array.shape[1] != len(self.mean_X):
+            raise ValueError(f"数据维度 {data_array.shape[1]} 与归一化参数维度 {len(self.mean_X)} 不匹配")
         
         # 归一化
         normalized_data = (data_array - self.mean_X) / self.std_X
@@ -456,8 +508,8 @@ class NozzleInferenceEvaluator:
 def main():
     """主函数：演示推理评估流程"""
     # 配置参数
-    model_path = './checkpoints_multitask/best_multitask_model.pth'
-    data_path = 'printer_dataset/nozzle_simulation_gear_print.csv'
+    model_path = './checkpoints_dual_gpu/best_multitask_model.pth'
+    data_path = 'enterprise_dataset/printer_enterprise_data.csv'
     
     # 检查文件是否存在
     if not os.path.exists(model_path):
