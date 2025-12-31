@@ -18,20 +18,20 @@ class Config:
         self.data_path = 'printer_dataset_correction/printer_gear_correction_dataset.csv'
         self.seq_len = 100           # 历史窗口长度 (100ms)
         self.pred_len = 20           # 预测长度 (20ms)
-        self.batch_size = 512
-        self.gradient_accumulation_steps = 2
+        self.batch_size = 2048
+        self.gradient_accumulation_steps = 1
         self.model_dim = 128
         self.num_heads = 8
         self.num_layers = 4
         self.dim_feedforward = 512
         self.dropout = 0.1
         self.lr = 1e-4
-        self.epochs = 40
+        self.epochs = 50
         self.device = 'cuda' if torch.cuda.is_available() else 'cpu'
-        self.lambda_physics = 0.2    # 物理约束权重
+        self.lambda_physics = 0.3    # 物理约束权重
         self.checkpoint_dir = './checkpoints_physical_predictor'
-        self.max_samples = 100000
-        self.warmup_epochs = 3
+        self.max_samples = 250000
+        self.warmup_epochs = 10
         os.makedirs(self.checkpoint_dir, exist_ok=True)
 
         # 特征列
