@@ -153,122 +153,119 @@ def train_fault_classifier(config):
     )
     
     # 创建模型
-    model = FaultClassifier(config).to(config.device)
+    model = FaultClassifier(config)
     if len(config.gpu_ids) > 1:
         model = nn.DataParallel(model, device_ids=config.gpu_ids)
+    model = model.to(config.device)
     
-    print(f"✅ 模型创建完成 | 参数量: {sum(p.numel() for p in model.parameters()):,}")
+    # 损失函数（使用标签平滑）
+    criterion = LabelSmoothingCrossEntropy(smoothing=0.1)
     
     # 优化器
-    optimizer = AdamW(model.parameters(), lr=config.lr, weight_decay=1e-4)
-    scheduler = ReduceLROnPlateau(
-        optimizer, mode='min', factor=0.5, patience=3
-    )
+    optimizer = torch.optim.AdamW(model.parameters(), lr=config.lr, weight_decay=0.01)
     
-    criterion = nn.CrossEntropyLoss()
+    # 混合精度训练
+    scaler = GradScaler()
     
-    # 恢复训练
-    start_epoch = 0
-    best_val_loss = float('inf')
+    # 训练循环
+    best_acc = 0.0
     train_losses = []
-    val_losses = []
+    val_accuracies = []
     
-    if config.resume_from and os.path.exists(config.resume_from):
-        print(f"🔄 从检查点恢复训练: {config.resume_from}")
-        checkpoint = torch.load(config.resume_from, map_location=config.device)
-        model_state = checkpoint['model_state_dict']
-        
-        if isinstance(model, nn.DataParallel):
-            model.module.load_state_dict(model_state)
-        else:
-            model.load_state_dict(model_state)
-        
-        optimizer.load_state_dict(checkpoint['optimizer_state_dict'])
-        scheduler.load_state_dict(checkpoint['scheduler_state_dict'])
-        start_epoch = checkpoint['epoch']
-        best_val_loss = checkpoint['best_val_loss']
-        train_losses = checkpoint.get('train_losses', [])
-        val_losses = checkpoint.get('val_losses', [])
-        print(f"✅ 恢复训练成功 | 从第 {start_epoch} 个epoch开始")
+    # 添加提前停止相关参数
+    patience = 5  # 允许连续5个epoch验证准确率不提升后停止训练
+    patience_counter = 0  # 计数器
+    min_delta = 0.001  # 验证准确率需要提升的最小值
     
-    print("\n🔥 开始训练故障分类器...")
-    print("-" * 80)
-    
-    for epoch in range(start_epoch, config.epochs):
-        epoch_start = time.time()
+    for epoch in range(config.epochs):
         model.train()
         total_loss = 0
+        num_batches = 0
         
-        for batch_idx, (seq, label) in enumerate(train_loader):
-            seq, label = seq.to(config.device), label.to(config.device)
-            pred = model(seq)
-            loss = criterion(pred, label)
+        train_pbar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{config.epochs}")
+        for batch_idx, (features, labels) in enumerate(train_pbar):
+            features, labels = features.to(config.device, non_blocking=True), labels.to(config.device, non_blocking=True).long()
             
-            loss.backward()
-            optimizer.step()
-            optimizer.zero_grad()
+            with autocast(device_type='cuda'):
+                outputs = model(features)
+                loss = criterion(outputs, labels)
+            
+            # 检查损失是否为NaN或无穷大
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"⚠️  跳过批次 {batch_idx}，检测到无效损失值")
+                continue
+            
+            scaler.scale(loss).backward()
+            
+            if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
+                scaler.step(optimizer)
+                scaler.update()
+                optimizer.zero_grad()
             
             total_loss += loss.item()
+            num_batches += 1
+            
+            train_pbar.set_postfix({'Loss': f"{loss.item():.6f}"})
         
-        avg_train_loss = total_loss / len(train_loader)
-        train_losses.append(avg_train_loss)
+        avg_loss = total_loss / num_batches if num_batches > 0 else float('inf')
+        train_losses.append(avg_loss)
         
         # 验证
-        model.eval()
-        val_loss = 0
-        correct = 0
-        total = 0
+        val_acc, val_loss = validate_fault_classifier(model, val_loader, config, scaler, criterion)
+        val_accuracies.append(val_acc)
         
-        with torch.no_grad():
-            for seq, label in val_loader:
-                seq, label = seq.to(config.device), label.to(config.device)
-                pred = model(seq)
-                loss = criterion(pred, label)
-                val_loss += loss.item()
-                
-                _, predicted = torch.max(pred, 1)
-                total += label.size(0)
-                correct += (predicted == label).sum().item()
-        
-        avg_val_loss = val_loss / len(val_loader)
-        val_losses.append(avg_val_loss)
-        accuracy = 100 * correct / total
-        scheduler.step(avg_val_loss)
-        
-        epoch_time = time.time() - epoch_start
-        elapsed_time = time.time() - epoch_start
-        remaining_epochs = config.epochs - epoch - 1
-        remaining_time = elapsed_time * remaining_epochs
-        remaining_time_str = str(timedelta(seconds=int(remaining_time)))
-        
-        print(f"✅ Epoch {epoch+1:2d}/{config.epochs} | "
-              f"Train Loss: {avg_train_loss:.6f} | "
-              f"Val Loss: {avg_val_loss:.6f} | "
-              f"Accuracy: {accuracy:.2f}% | "
-              f"Time: {epoch_time:.2f}s | "
-              f"剩余时间: {remaining_time_str}")
+        print(f"Epoch {epoch+1}/{config.epochs} | Train Loss: {avg_loss:.6f} | Val Acc: {val_acc:.4f} | Val Loss: {val_loss:.6f}")
         
         # 保存最佳模型
-        if avg_val_loss < best_val_loss:
-            best_val_loss = avg_val_loss
-            checkpoint_data = {
-                'epoch': epoch + 1,
-                'model_state_dict': model.module.state_dict() if isinstance(model, nn.DataParallel) else model.state_dict(),
+        if val_acc > best_acc:
+            best_acc = val_acc
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
                 'optimizer_state_dict': optimizer.state_dict(),
-                'scheduler_state_dict': scheduler.state_dict(),
-                'train_loss': avg_train_loss,
-                'val_loss': avg_val_loss,
-                'best_val_loss': best_val_loss,
-                'train_losses': train_losses,
-                'val_losses': val_losses,
-                'config': config.__dict__
-            }
-            torch.save(checkpoint_data, os.path.join(config.checkpoint_dir, 'best_fault_classifier.pth'))
-            print(f"   💾 保存最佳故障分类器 (验证损失: {best_val_loss:.6f}, 准确率: {accuracy:.2f}%)")
+                'accuracy': best_acc,
+            }, os.path.join(config.checkpoint_dir, 'best_fault_classifier.pth'))
+            print(f"✅ 最佳模型已保存 (Acc: {best_acc:.4f})")
+            patience_counter = 0  # 重置计数器
+        else:
+            patience_counter += 1
+            
+        # 每5个epoch保存一次检查点
+        if (epoch + 1) % 5 == 0:
+            torch.save({
+                'epoch': epoch,
+                'model_state_dict': model.state_dict(),
+                'optimizer_state_dict': optimizer.state_dict(),
+                'accuracy': val_acc,
+            }, os.path.join(config.checkpoint_dir, f'fault_classifier_epoch{epoch+1}.pth'))
+            print(f"💾 epoch {epoch+1} 的检查点已保存")
+        
+        # 检查是否需要提前停止
+        if patience_counter >= patience:
+            print(f"⚠️  验证准确率连续 {patience} 个epoch未提升，停止训练...")
+            break
     
-    print("\n" + "=" * 80)
-    print(f"🎉 故障分类器训练完成! 最佳验证损失: {best_val_loss:.6f}")
-    print("=" * 80)
+    # 绘制训练曲线
+    plt.figure(figsize=(12, 5))
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.title('故障分类器训练损失')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    
+    plt.subplot(1, 2, 2)
+    plt.plot(val_accuracies, label='Validation Accuracy', color='orange')
+    plt.title('故障分类器验证准确率')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    
+    plt.tight_layout()
+    plt.savefig(os.path.join(config.checkpoint_dir, 'fault_classifier_training_curve.png'), dpi=300, bbox_inches='tight')
+    plt.close()
+    
+    print(f"🎉 故障分类器训练完成！最佳验证准确率: {best_acc:.4f}")
 
 # ==================== 主函数 ====================
 if __name__ == "__main__":

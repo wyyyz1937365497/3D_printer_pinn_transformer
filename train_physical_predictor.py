@@ -22,15 +22,15 @@ class Config:
         self.data_dir = 'printer_dataset_correction/'  # 数据目录
         self.seq_len = 250
         self.pred_len = 50
-        self.batch_size = 2048  # 增加batch size以提高训练效率
-        self.gradient_accumulation_steps = 2
+        self.batch_size = 1024  # 增加batch size以提高训练效率
+        self.gradient_accumulation_steps = 1
         self.model_dim = 192
         self.num_heads = 8
         self.num_layers = 6
         self.dim_feedforward = 768
         self.dropout = 0.1
         self.lr = 5e-5
-        self.epochs = 60  # 可能需要减少epochs，因为数据量大
+        self.epochs = 30  # 可能需要减少epochs，因为数据量大
         self.gpu_ids = gpu_ids
         self.resume_from = resume_from
         self.device = f'cuda:{gpu_ids[0]}' if torch.cuda.is_available() else 'cpu'
@@ -136,44 +136,88 @@ class EnhancedPhysicalPredictor(nn.Module):
     def physics_loss(self, pred, target, dt=0.001):
         loss = 0.0
         if len(pred) > 1:
-            vib_x_smooth = torch.mean(torch.abs(torch.diff(pred[:, 0])))
-            vib_y_smooth = torch.mean(torch.abs(torch.diff(pred[:, 1])))
-            loss += 0.3 * (vib_x_smooth + vib_y_smooth)
+            # 振动平滑损失
+            if len(pred) > 1:
+                vib_x_smooth = torch.mean(torch.abs(torch.diff(pred[:, 0])))
+                vib_y_smooth = torch.mean(torch.abs(torch.diff(pred[:, 1])))
+                # 使用clamp防止数值不稳定
+                vib_x_smooth = torch.clamp(vib_x_smooth, max=1e3)
+                vib_y_smooth = torch.clamp(vib_y_smooth, max=1e3)
+                loss += 0.3 * (vib_x_smooth + vib_y_smooth)
             
-            dT_dt = torch.diff(pred[:, 2]) / dt
-            d2T_dt2 = torch.diff(dT_dt) / dt
-            thermal_smooth = torch.mean(torch.abs(d2T_dt2))
-            loss += 0.2 * thermal_smooth
+            # 温度平滑损失
+            if len(pred) > 2:
+                dT_dt = torch.diff(pred[:, 2]) / dt
+                if len(dT_dt) > 1:
+                    d2T_dt2 = torch.diff(dT_dt) / dt
+                    thermal_smooth = torch.mean(torch.abs(d2T_dt2))
+                    # 使用clamp防止数值不稳定
+                    thermal_smooth = torch.clamp(thermal_smooth, max=1e3)
+                    loss += 0.2 * thermal_smooth
             
-            temp_change = torch.mean(torch.abs(torch.diff(pred[:, 2])))
-            loss += 0.3 * torch.clamp(temp_change - 1.0, min=0)
+            # 温度变化限制
+            if len(pred) > 1:
+                temp_change = torch.mean(torch.abs(torch.diff(pred[:, 2])))
+                temp_change = torch.clamp(temp_change, max=1e2)
+                loss += 0.3 * torch.clamp(temp_change - 1.0, min=0, max=1e2)
             
-            vib_mag = torch.sqrt(pred[:,0]**2 + pred[:,1]**2)
-            cur_mag = torch.sqrt(pred[:,3]**2 + pred[:,4]**2)
-            if len(vib_mag) > 1:
-                vib_mean = torch.mean(vib_mag)
-                cur_mean = torch.mean(cur_mag)
-                vib_c = vib_mag - vib_mean
-                cur_c = cur_mag - cur_mean
-                corr = torch.sum(vib_c * cur_c) / (torch.sqrt(torch.sum(vib_c**2)) * torch.sqrt(torch.sum(cur_c**2)) + 1e-8)
-                loss += 0.2 * torch.relu(0.3 - corr)
+            # 振动-电流相关性损失
+            if len(pred) > 3:
+                vib_mag = torch.sqrt(pred[:,0]**2 + pred[:,1]**2 + 1e-8)  # 防止sqrt(0)
+                cur_mag = torch.sqrt(pred[:,3]**2 + pred[:,4]**2 + 1e-8)  # 防止sqrt(0)
+                if len(vib_mag) > 1:
+                    vib_mean = torch.mean(vib_mag)
+                    cur_mean = torch.mean(cur_mag)
+                    vib_c = vib_mag - vib_mean
+                    cur_c = cur_mag - cur_mean
+                    # 计算相关系数时防止除零
+                    vib_var = torch.sum(vib_c**2)
+                    cur_var = torch.sum(cur_c**2)
+                    if vib_var > 1e-8 and cur_var > 1e-8:
+                        corr = torch.sum(vib_c * cur_c) / (torch.sqrt(vib_var * cur_var) + 1e-8)
+                        loss += 0.2 * torch.relu(0.3 - corr)
+        
+        # 使用clamp防止loss过大
+        loss = torch.clamp(loss, max=1e4)
         return loss
     
     def frequency_loss(self, pred, target):
+        # 确保输入是float32以避免精度问题
         pred = pred.float()
         target = target.float()
-        pred_x_fft = torch.fft.rfft(pred[:, 0])
-        pred_y_fft = torch.fft.rfft(pred[:, 1])
-        target_x_fft = torch.fft.rfft(target[:, 0])
-        target_y_fft = torch.fft.rfft(target[:, 1])
         
-        max_bins = min(10, pred_x_fft.shape[0])
-        pred_x_mag = torch.abs(pred_x_fft[:max_bins])
-        pred_y_mag = torch.abs(pred_y_fft[:max_bins])
-        target_x_mag = torch.abs(target_x_fft[:max_bins])
-        target_y_mag = torch.abs(target_y_fft[:max_bins])
+        # 检查输入长度，避免微分操作失败
+        if len(pred) < 2:
+            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         
-        return nn.MSELoss()(pred_x_mag, target_x_mag) + nn.MSELoss()(pred_y_mag, target_y_mag)
+        try:
+            pred_x_fft = torch.fft.rfft(pred[:, 0])
+            pred_y_fft = torch.fft.rfft(pred[:, 1])
+            target_x_fft = torch.fft.rfft(target[:, 0])
+            target_y_fft = torch.fft.rfft(target[:, 1])
+            
+            # 限制FFT的最大频率分量数量
+            max_bins = min(10, pred_x_fft.shape[0])
+            pred_x_mag = torch.abs(pred_x_fft[:max_bins])
+            pred_y_mag = torch.abs(pred_y_fft[:max_bins])
+            target_x_mag = torch.abs(target_x_fft[:max_bins])
+            target_y_mag = torch.abs(target_y_fft[:max_bins])
+            
+            # 使用clamp防止数值不稳定
+            pred_x_mag = torch.clamp(pred_x_mag, max=1e3)
+            pred_y_mag = torch.clamp(pred_y_mag, max=1e3)
+            target_x_mag = torch.clamp(target_x_mag, max=1e3)
+            target_y_mag = torch.clamp(target_y_mag, max=1e3)
+            
+            mse_loss = nn.MSELoss()
+            loss = mse_loss(pred_x_mag, target_x_mag) + mse_loss(pred_y_mag, target_y_mag)
+            
+            # 再次clamp防止loss过大
+            loss = torch.clamp(loss, max=1e4)
+            return loss
+        except RuntimeError:
+            # 如果FFT失败，返回0损失
+            return torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
 
 class FrequencyFeatureProcessor:
     """频域特征处理器，支持缓存到.npy文件"""
@@ -404,6 +448,11 @@ def validate_model(model, config, scaler):
                 
                 loss = mse_loss + config.lambda_physics * physics_loss + config.lambda_freq * freq_loss
             
+            # 检查损失是否为NaN或无穷大
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"⚠️  跳过验证批次 {batch_idx}，检测到无效损失值")
+                continue
+            
             total_loss += loss.item()
             total_batches += 1
     
@@ -446,6 +495,11 @@ def train_model(config):
     train_losses = []
     val_losses = []
     
+    # 添加提前停止相关参数
+    patience = 5  # 允许连续5个epoch验证损失不下降后停止训练
+    patience_counter = 0  # 计数器
+    min_delta = 0.001  # 验证损失需要下降的最小值，否则视为停滞
+    
     for epoch in range(config.epochs):
         # 创建训练数据集和加载器
         train_dataset = StreamingPhysicalDataset(config.data_dir, config, split='train')
@@ -478,11 +532,20 @@ def train_model(config):
                 
                 loss = mse_loss + config.lambda_physics * physics_loss + config.lambda_freq * freq_loss
             
+            # 检查损失是否为NaN或无穷大，如果是则跳过此批次
+            if torch.isnan(loss) or torch.isinf(loss):
+                print(f"⚠️  跳过批次 {batch_idx}，检测到无效损失值")
+                continue
+            
             # 反向传播
             scaler.scale(loss / config.gradient_accumulation_steps).backward()
             
             # 梯度累积更新
             if (batch_idx + 1) % config.gradient_accumulation_steps == 0:
+                # 梯度裁剪以防止梯度爆炸
+                scaler.unscale_(optimizer)
+                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                
                 scaler.step(optimizer)
                 scaler.update()
                 optimizer.zero_grad()
@@ -537,7 +600,10 @@ def train_model(config):
                 'loss': best_loss,
             }, os.path.join(config.checkpoint_dir, 'best_physical_predictor.pth'))
             print(f"✅ 最佳模型已保存 (Loss: {best_loss:.6f})")
-        
+            patience_counter = 0  # 重置计数器
+        else:
+            patience_counter += 1
+            
         if (epoch + 1) % 5 == 0:
             torch.save({
                 'epoch': epoch,
@@ -546,6 +612,11 @@ def train_model(config):
                 'loss': val_loss,
             }, os.path.join(config.checkpoint_dir, f'checkpoint_epoch{epoch+1}.pth'))
             print(f"💾 epoch {epoch+1} 的检查点已保存")
+        
+        # 检查是否需要提前停止
+        if patience_counter >= patience:
+            print(f"⚠️  验证损失连续 {patience} 个epoch未改善，停止训练...")
+            break
     
     # 绘制训练曲线
     plt.figure(figsize=(12, 5))
